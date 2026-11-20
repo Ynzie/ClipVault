@@ -1,0 +1,18 @@
+# build outputs
+.venv/
+build/
+dist/
+*.spec
+*.zip
+
+# downloaded by build.bat (FFmpeg ~200 MB, libmpv ~120 MB: too big for git)
+ffmpeg/
+mpv/
+
+# python
+__pycache__/
+*.py[cod]
+
+# local stuff
+diagnostics/
+*.log
