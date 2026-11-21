@@ -91,8 +91,10 @@ def gpu_tonemap_ok() -> bool:
     if not has_filter("libplacebo"):
         return False
     try:
+        from . import hdr as _h
+        chain = _h.tonemap_chain({}, None, None, None, out_fmt="yuv420p")
         r = run([ffmpeg_path(), "-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=gray:s=64x64",
-                 "-vf", "format=gbrp10le,libplacebo=format=yuv420p", "-frames:v", "1", "-f", "null", "-"], timeout=20)
+                 "-vf", "format=gbrpf32le," + chain, "-frames:v", "1", "-f", "null", "-"], timeout=20)
         return r.returncode == 0
     except Exception:
         return False
@@ -280,8 +282,8 @@ def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path
     hdr_mode = "sdr"
     if hdr_on:
         hdr_mode = {"tonemap": "tonemap", "hdr10": "hdr10", "windows": "windows"}.get(h.get("mode"), "tonemap")
-        if hdr_mode == "tonemap" and h.get("engine") == "gpu" and not gpu_tonemap_ok():
-            h = dict(h, engine="cpu")
+        if hdr_mode in ("tonemap", "hdr10") and not gpu_tonemap_ok():
+            hdr_mode = "windows"  # float HDR frames can only be processed on the GPU (libplacebo/Vulkan)
     ten_bit = hdr_mode == "hdr10"
     codec = q.get("codec", "hevc")
     if ten_bit and codec == "h264":
@@ -292,7 +294,7 @@ def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path
     cfr = rec.get("framerate_mode") == "cfr"
     dda = (f"ddagrab=output_idx={mon.get('idx', 0)}:framerate={fps}"
            f":draw_mouse={1 if rec.get('show_cursor') else 0}:dup_frames={1 if cfr else 0}"
-           f":output_fmt={'10bit' if hdr_mode in ('tonemap', 'hdr10') else '8bit'}")
+           f":output_fmt={'16bit' if hdr_mode in ('tonemap', 'hdr10') else '8bit'}")
 
     zero_copy = (q.get("zero_copy", True) and not force_cpu_path and hdr_mode in ("sdr", "windows")
                  and out_w is None and vendor in ("amf", "nvenc"))
@@ -300,9 +302,9 @@ def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path
     if zero_copy:
         vchain = "null"
     elif hdr_mode == "tonemap":
-        vchain = "hwdownload,format=x2bgr10le,format=gbrp10le," + hdrmod.tonemap_chain(h, display_hdr, out_w, out_h)
+        vchain = f"hwdownload,format={hdrmod.CAPTURE_PIXFMT}," + hdrmod.tonemap_chain(h, display_hdr, out_w, out_h)
     elif hdr_mode == "hdr10":
-        vchain = "hwdownload,format=x2bgr10le," + hdrmod.hdr10_chain(out_w, out_h)
+        vchain = f"hwdownload,format={hdrmod.CAPTURE_PIXFMT}," + hdrmod.hdr10_chain(out_w, out_h)
     else:
         size = f"{out_w}:{out_h}:flags=bicubic:" if out_w else ""
         vchain = f"hwdownload,format=bgra,scale={size}out_color_matrix=bt709:out_range=tv,format=nv12"
@@ -312,11 +314,11 @@ def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path
     if not IS_WIN:  # dev/test harness: synthetic source standing in for ddagrab
         dda = f"testsrc2=size=1280x720:rate={fps}"
         if hdr_mode in ("tonemap", "hdr10"):
-            fake = ("zscale=tin=bt709:min=bt709:pin=bt709:rin=tv:t=smpte2084:p=bt2020:m=gbr:r=full:npl=203,"
-                    "format=gbrp10le,format=x2bgr10le")
+            fake = "format=gbrpf32le"  # (swscale can't write rgbaf16; libplacebo reads either)
         else:
             fake = "format=bgra"
-        vchain = vchain.replace("hwdownload,format=x2bgr10le", fake, 1).replace("hwdownload,format=bgra", fake, 1)
+        vchain = (vchain.replace(f"hwdownload,format={hdrmod.CAPTURE_PIXFMT}", fake, 1)
+                  .replace("hwdownload,format=bgra", fake, 1))
 
     common_in = ["-use_wallclock_as_timestamps", "1", "-itsoffset", f"{-t0:.6f}"]
     args = [ffmpeg_path(), "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-copyts"]
@@ -371,7 +373,7 @@ def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path
 
     desc = f"{VENDOR_LABEL.get(vendor, vendor)} · {enc} · {'zero-copy' if zero_copy else 'filtered'}"
     if hdr_mode == "tonemap":
-        desc += f" · HDR→SDR ({h.get('engine', 'gpu').upper()})"
+        desc += " · HDR→SDR (GPU)"
     elif hdr_mode == "hdr10":
         desc += " · HDR10"
     plan = RecordPlan(args, vendor, enc, hdr_mode, zero_copy, desc, titles)
@@ -382,50 +384,55 @@ def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path
 
 # ----------------------------------------------------------------------------- screenshots & previews
 
-def screenshot_command(cfg, mon: dict, out_png: Path, display_hdr, raw_hdr_png: Path | None = None) -> list[str]:
+def hdr_tonemap_wanted(cfg, display_hdr) -> bool:
     h = cfg.get("hdr")
     hdr_on = {"on": True, "off": False}.get(h.get("detect", "auto"), bool(display_hdr and display_hdr.hdr_enabled))
-    tonemap = hdr_on and h.get("mode") in ("tonemap", "hdr10")
-    if tonemap and h.get("engine") == "gpu" and not gpu_tonemap_ok():
-        h = dict(h, engine="cpu")
-    dda = f"ddagrab=output_idx={mon.get('idx', 0)}:framerate=5:draw_mouse=0:output_fmt={'10bit' if tonemap else '8bit'}"
+    return hdr_on and h.get("mode") in ("tonemap", "hdr10") and gpu_tonemap_ok()
+
+
+def screenshot_command(cfg, mon: dict, out_png: Path, display_hdr) -> list[str]:
+    tonemap = hdr_tonemap_wanted(cfg, display_hdr)
+    dda = f"ddagrab=output_idx={mon.get('idx', 0)}:framerate=5:draw_mouse=0:output_fmt={'16bit' if tonemap else '8bit'}"
     args = [ffmpeg_path(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", dda]
     if tonemap:
-        chain = ("hwdownload,format=x2bgr10le,format=gbrp10le,"
-                 + hdrmod.tonemap_chain(h, display_hdr, None, None, out_fmt="yuv420p")
-                 + ",scale=in_color_matrix=bt709:in_range=tv,format=rgb24")
-        if raw_hdr_png:  # also keep the untouched HDR frame for the tuning preview
-            args += ["-filter_complex", f"[0:v]hwdownload,format=x2bgr10le,split=2[a][b];"
-                                        f"[a]format=gbrp10le,{chain.split(',', 2)[2]}[o];[b]format=rgb48le[r]",
-                     "-map", "[o]", "-frames:v", "1", str(out_png), "-map", "[r]", "-frames:v", "1", str(raw_hdr_png)]
-            return args
-        args += ["-vf", chain]
+        args += ["-vf", f"hwdownload,format={hdrmod.CAPTURE_PIXFMT},"
+                        + hdrmod.tonemap_chain(cfg.get("hdr"), display_hdr, None, None, out_fmt="gbrp")]
     else:
         args += ["-vf", "hwdownload,format=bgra,format=rgb24"]
-    return args + ["-frames:v", "1", str(out_png)]
+    return args + ["-frames:v", "1", "-update", "1", str(out_png)]
 
 
-def grab_raw_hdr_command(mon: dict, out_png: Path) -> list[str]:
-    """Grab one untouched 10-bit HDR frame (PQ values stored in a 16-bit PNG)."""
-    dda = f"ddagrab=output_idx={mon.get('idx', 0)}:framerate=5:draw_mouse=0:output_fmt=10bit"
+def grab_raw_hdr_command(mon: dict, out_raw: Path) -> list[str]:
+    """Grab one untouched HDR frame: raw linear scRGB half floats (rgbaf16le), monitor-sized."""
+    dda = f"ddagrab=output_idx={mon.get('idx', 0)}:framerate=5:draw_mouse=0:output_fmt=16bit"
     return [ffmpeg_path(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", dda,
-            "-vf", "hwdownload,format=x2bgr10le,format=rgb48le", "-frames:v", "1", str(out_png)]
+            "-vf", f"hwdownload,format={hdrmod.CAPTURE_PIXFMT}", "-frames:v", "1",
+            "-f", "rawvideo", "-pix_fmt", hdrmod.CAPTURE_PIXFMT, str(out_raw)]
 
 
-def preview_tonemap_command(hdr_cfg: dict, display_hdr, raw_png: Path, out_png: Path, width: int = 960) -> list[str]:
-    h = dict(hdr_cfg)
-    if h.get("engine") == "gpu" and not gpu_tonemap_ok():
-        h["engine"] = "cpu"
-    chain = "format=gbrp16le," + hdrmod.tonemap_chain(h, display_hdr, None, None, out_fmt="yuv420p")
-    chain += f",scale={width}:-2:in_color_matrix=bt709:in_range=tv,format=rgb24"
-    return [ffmpeg_path(), "-hide_banner", "-v", "error", "-y", "-i", str(raw_png), "-vf", chain,
-            "-frames:v", "1", str(out_png)]
+def raw_hdr_size(raw: Path, mon: dict) -> tuple[int, int] | None:
+    """Work out the dimensions of a raw grab (8 bytes per pixel) from the monitor size."""
+    try:
+        n = raw.stat().st_size // 8
+    except OSError:
+        return None
+    w, h = int(mon.get("w") or 0), int(mon.get("h") or 0)
+    for cw, ch in ((w, h), (h, w)):
+        if cw and ch and cw * ch == n:
+            return cw, ch
+    return None
 
 
-def preview_naive_command(raw_png: Path, out_png: Path, width: int = 960) -> list[str]:
-    """What an HDR clip looks like when nothing fixes it (PQ shown as if SDR: washed out)."""
-    return [ffmpeg_path(), "-hide_banner", "-v", "error", "-y", "-i", str(raw_png),
-            "-vf", f"scale={width}:-2,format=rgb24", "-frames:v", "1", str(out_png)]
+def _raw_input(raw: Path, size: tuple[int, int]) -> list[str]:
+    return ["-f", "rawvideo", "-pix_fmt", hdrmod.CAPTURE_PIXFMT, "-s", f"{size[0]}x{size[1]}", "-i", str(raw)]
+
+
+def preview_tonemap_command(hdr_cfg: dict, display_hdr, raw: Path, size: tuple[int, int], out_png: Path,
+                            width: int = 960) -> list[str]:
+    hgt = max(2, round(size[1] * width / size[0] / 2) * 2)
+    chain = hdrmod.tonemap_chain(hdr_cfg, display_hdr, width, hgt, out_fmt="gbrp")
+    return [ffmpeg_path(), "-hide_banner", "-v", "error", "-y", *_raw_input(raw, size), "-vf", chain,
+            "-frames:v", "1", "-update", "1", str(out_png)]
 
 
 # ----------------------------------------------------------------------------- clip / export

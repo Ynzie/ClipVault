@@ -1,7 +1,9 @@
 """Main window: sidebar, status, hotkey bar, pages, tray."""
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QSize, QRectF
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction, QLinearGradient, QPainterPath
@@ -17,6 +19,36 @@ from .library_view import LibraryView, human_size, human_dur
 from .editor_view import EditorView
 from .settings_view import SettingsView
 from .review_view import ReviewView
+
+
+def promote_tray_icon() -> bool:
+    """Set IsPromoted for ClipVault.exe's entry under HKCU\\Control Panel\\NotifyIconSettings (Windows 11)."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return False
+    import winreg
+    tail = "\\" + Path(sys.executable).name.lower()
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\NotifyIconSettings")
+    except OSError:
+        return False
+    found = False
+    with root:
+        i = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                with winreg.OpenKey(root, sub, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+                    path, _ = winreg.QueryValueEx(k, "ExecutablePath")
+                    if str(path).lower().replace("/", "\\").endswith(tail):
+                        winreg.SetValueEx(k, "IsPromoted", 0, winreg.REG_DWORD, 1)
+                        found = True
+            except OSError:
+                continue
+    return found
 
 
 def app_icon(p: dict, size=256) -> QIcon:
@@ -62,6 +94,8 @@ class MainWindow(QMainWindow):
         self.tray = QSystemTrayIcon(app_icon(W.P), self)
         self._build_tray()
         self.tray.show()
+        if not ctl.cfg.get("app.tray_promoted", False):
+            QTimer.singleShot(3000, self._promote_tray)
         ctl.bridge.event.connect(self._on_event)
         self._hk_timer = QTimer(self, singleShot=True, interval=200, timeout=self._rebuild_topbar)
         ctl.cfg.on_change(lambda k, v: (k.startswith("hotkeys") or k == "recording.clip_alt_seconds") and W.ui_call(self._hk_timer.start))
@@ -303,6 +337,17 @@ class MainWindow(QMainWindow):
         self.topbar = self._topbar()
         self._right_layout.replaceWidget(old, self.topbar)
         old.deleteLater()
+
+    def _promote_tray(self):
+        """Windows 11 tucks new tray icons behind the ^ arrow. Put ours on the taskbar - once, so if you
+        hide it again later, it stays hidden."""
+        try:
+            if promote_tray_icon():
+                self.ctl.cfg.set("app.tray_promoted", True)
+                self.tray.hide()  # re-add the icon so Explorer applies the change now
+                self.tray.show()
+        except Exception:
+            pass
 
     def _build_tray(self):
         m = QMenu()

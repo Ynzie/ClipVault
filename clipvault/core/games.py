@@ -28,6 +28,7 @@ NEVER_GAMES = {x.lower() for x in (
     "ShareX.exe", "Lightshot.exe", "Greenshot.exe", "PowerToys.exe", "PowerToys.ScreenRuler.exe",
     "PowerToys.ColorPickerUI.exe", "PowerToys.MeasureToolUI.exe", "PowerToys.PowerOCR.exe", "PowerToys.Peek.UI.exe",
     "Magnify.exe", "osk.exe", "XboxGameBar.exe", "GameBar.exe", "GameBarFTServer.exe", "mstsc.exe", "msrdc.exe",
+    "TeamViewer.exe", "TeamViewer_Desktop.exe", "AnyDesk.exe", "RustDesk.exe", "parsecd.exe",
     # fullscreen video in a browser / chat / player isn't a game either
     "brave.exe", "chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "vivaldi.exe", "Discord.exe",
     "Spotify.exe", "Microsoft.Media.Player.exe", "vlc.exe", "mpc-hc64.exe", "PotPlayerMini64.exe", "mpv.exe",

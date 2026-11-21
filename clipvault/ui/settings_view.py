@@ -723,17 +723,13 @@ class SettingsView(QWidget):
         c.lay.addSpacing(6)
         m = QLabel("Auto-fix: clips look like your screen and play right everywhere (Discord, phones). "
                    "Keep HDR10: true HDR files for HDR TVs/YouTube (look washed out on SDR screens). "
-                   "Windows default: what most recorders do — fastest, but dull or blown-out highlights.")
+                   "Windows default: what most recorders do — fastest, but anything brighter than 80 nits blows out.")
         m.setObjectName("muted")
         m.setWordWrap(True)
         c.add(m)
         c.lay.addSpacing(6)
         c.add_row("HDR detection", "", combo([("auto", "Automatic"), ("on", "Always treat as HDR"), ("off", "Never (SDR)")],
                                              self.cfg.get("hdr.detect"), lambda d: self.cfg.set("hdr.detect", d), 200))
-        eng = Segmented([("gpu", "GPU (libplacebo)"), ("cpu", "CPU (exact)")], self.cfg.get("hdr.engine"))
-        eng.changed.connect(lambda k: (self.cfg.set("hdr.engine", k), self._hdr_preview_soon()))
-        c.add_row("Tone-mapping engine", "GPU: smart per-scene brightness, near-zero CPU. CPU: exact match to your Windows "
-                  "SDR white (uses a few CPU cores at 1440p60).", eng)
         v.addWidget(c)
 
         c = Card("Brightness")
@@ -745,12 +741,13 @@ class SettingsView(QWidget):
         self.white_slider.setEnabled(not self.cfg.get("hdr.auto_white"))
         self.white_slider.valueChanged.connect(lambda x: (self.cfg.set("hdr.white_nits", int(x)), self._hdr_preview_soon()))
         c.add_row("Reference white (manual)", "Raise if clips look too bright, lower if too dark.", self.white_slider)
-        c.add_row("Highlight curve", "", combo([("bt.2390", "Natural (BT.2390)"), ("spline", "Soft"), ("hable", "Filmic (punchy)"),
-                                                ("reinhard", "Reinhard"), ("clip", "Hard clip")],
-                                               self.cfg.get("hdr.curve"), lambda d: (self.cfg.set("hdr.curve", d), self._hdr_preview_soon()), 200))
-        pd = Toggle(self.cfg.get("hdr.peak_detect"))
-        pd.toggled.connect(lambda x: (self.cfg.set("hdr.peak_detect", x), self._hdr_preview_soon()))
-        c.add_row("Per-scene auto brightness", "Adapts to each scene's brightest point (GPU engine).", pd)
+        peaks = [("0", "Automatic (display)")] + [(str(n), f"{n} nits") for n in (400, 600, 800, 1000, 1500, 2000, 4000)]
+        cur = str(int(self.cfg.get("hdr.peak_nits", 0) or 0))
+        if cur not in dict(peaks):
+            cur = "0"
+        c.add_row("Brightest highlights", "How bright HDR highlights can get. Anything between your SDR white and this "
+                  "is rolled off smoothly instead of blowing out. Automatic uses what your display reports.",
+                  combo(peaks, cur, lambda d: (self.cfg.set("hdr.peak_nits", int(d)), self._hdr_preview_soon()), 200))
         self.trims = {}
         for key, label, lo, hi, step, fmt in (("brightness", "Brightness", -0.3, 0.3, 0.01, "{:+.2f}"),
                                                ("contrast", "Contrast", 0.5, 1.5, 0.01, "{:.2f}×"),
@@ -773,9 +770,6 @@ class SettingsView(QWidget):
         grab.setIcon(icon("camera", "#0b0b10"))
         grab.clicked.connect(self._hdr_grab)
         row.addWidget(grab)
-        load = QPushButton("Use HDR screenshot file…")
-        load.clicked.connect(self._hdr_load)
-        row.addWidget(load)
         row.addStretch(1)
         self.prev_status = QLabel()
         self.prev_status.setObjectName("muted")
@@ -798,7 +792,8 @@ class SettingsView(QWidget):
         c.lay.addLayout(imgs)
         v.addWidget(c)
         self._prev_dir = Path(tempfile.mkdtemp(prefix="clipvault_hdr_"))
-        self._raw_png = self._prev_dir / "raw.png"
+        self._raw_png = self._prev_dir / "raw.f16"
+        self._raw_size = None
         self._hdr_timer = QTimer(self, singleShot=True, interval=250, timeout=self._hdr_render)
         self._hdr_busy = False
         return page
@@ -813,13 +808,15 @@ class SettingsView(QWidget):
             if st is None:
                 txt = "Couldn't read display HDR state (not on Windows?). Detection set to automatic falls back to SDR."
             elif st.hdr_enabled:
-                txt = (f"<b>HDR is ON</b> for {st.gdi_name} · Windows SDR content brightness ≈ <b>{st.sdr_white_nits:.0f} nits</b> · "
-                       f"{st.bits_per_channel}-bit. Auto-fix will tone-map your clips to match.")
+                peak = f" · display peak {st.max_nits:.0f} nits" if st.max_nits else ""
+                txt = (f"<b>HDR is ON</b> for {st.gdi_name} · Windows SDR content brightness ≈ <b>{st.sdr_white_nits:.0f} nits</b>"
+                       f"{peak} · {st.bits_per_channel}-bit. Auto-fix will tone-map your clips to match.")
             else:
                 txt = (f"HDR is off for {st.gdi_name}{' (supported)' if st.hdr_supported else ''}. Clips record as normal SDR — "
                        "nothing to fix.")
             if not gpu:
-                txt += "<br>⚠ GPU tone-mapping (libplacebo/Vulkan) isn't available here — the CPU engine will be used."
+                txt += ("<br>⚠ The HDR fix needs GPU processing (libplacebo/Vulkan), which isn't available here — "
+                        "HDR clips will use Windows default capture.")
             self._hdr_state = st
             W.ui_call(lambda: self.hdr_status_lbl.setText(txt))
         threading.Thread(target=work, daemon=True).start()
@@ -841,13 +838,14 @@ class SettingsView(QWidget):
             mons = getattr(self.ctl.recorder, "_mons", None) or ff.probe_monitors()
             mon = next((m for m in mons if m["idx"] == int(self.cfg.get("recording.monitor", 0))), mons[0])
             r = ff.run(ff.grab_raw_hdr_command(mon, self._raw_png), timeout=20)
-            ok = r.returncode == 0 and self._raw_png.exists()
+            self._raw_size = ff.raw_hdr_size(self._raw_png, mon) if r.returncode == 0 else None
+            ok = self._raw_size is not None
             # what "Windows default" capture (8-bit DDA) looks like at the same moment
             left = self._prev_dir / "left.png"
             ff.run([ff.ffmpeg_path(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i",
                     f"ddagrab=output_idx={mon['idx']}:framerate=5:output_fmt=8bit", "-vf",
                     "hwdownload,format=bgra,scale=960:-2,format=rgb24", "-frames:v", "1", str(left)], timeout=20)
-            msg = "" if ok else ("Couldn't grab a 10-bit frame — is HDR on for this display? " + r.stderr[-200:])
+            msg = "" if ok else ("Couldn't grab an HDR frame — is HDR on for this display? " + r.stderr[-200:])
             W.ui_call(lambda: self._after_grab(ok, msg, left))
         threading.Thread(target=work, daemon=True).start()
 
@@ -858,36 +856,23 @@ class SettingsView(QWidget):
         if ok:
             self._hdr_render()
 
-    def _hdr_load(self):
-        f, _ = QFileDialog.getOpenFileName(self, "16-bit PQ PNG", str(Path.home()), "PNG (*.png)")
-        if f:
-            import shutil
-            shutil.copy(f, self._raw_png)
-            naive = self._prev_dir / "naive.png"
-            ff.run(ff.preview_naive_command(self._raw_png, naive))
-            self._set_prev(self.prev_left, naive)
-            self._hdr_render()
-
     def _hdr_preview_soon(self):
-        if self._raw_png.exists():
+        if self._raw_size:
             self._hdr_timer.start()
 
     def _hdr_render(self):
-        if self._hdr_busy or not self._raw_png.exists():
-            if self._raw_png.exists():
+        if self._hdr_busy or not self._raw_size:
+            if self._raw_size:
                 self._hdr_timer.start()
             return
         self._hdr_busy = True
         h = dict(self.cfg.get("hdr"))
         st = getattr(self, "_hdr_state", None)
         out = self._prev_dir / "fixed.png"
-        mode = h.get("mode")
+        size = self._raw_size
 
         def work():
-            if mode == "tonemap":
-                r = ff.run(ff.preview_tonemap_command(h, st, self._raw_png, out), timeout=30)
-            else:
-                r = ff.run(ff.preview_naive_command(self._raw_png, out), timeout=30)
+            r = ff.run(ff.preview_tonemap_command(h, st, self._raw_png, size, out), timeout=30)
             def done():
                 self._hdr_busy = False
                 if r.returncode == 0:

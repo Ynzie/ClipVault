@@ -86,6 +86,8 @@ class GameOverlay(QWidget):
             u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | 0x08000000 | 0x00000020 | 0x00080000 | 0x00000080 | 0x00000008)
             # HWND_TOPMOST, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW
             u.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010 | 0x0040)
+            # WDA_EXCLUDEFROMCAPTURE (Win10 2004+): you see the pop-up, your recordings don't
+            u.SetWindowDisplayAffinity(hwnd, 0x11)
         except Exception:
             pass
 

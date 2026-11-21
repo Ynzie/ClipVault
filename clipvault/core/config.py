@@ -86,16 +86,13 @@ DEFAULTS: dict = {
     "hdr": {
         "detect": "auto",       # auto | on | off  (is the display in HDR?)
         "mode": "tonemap",      # tonemap (HDR->SDR fix) | hdr10 (keep HDR) | windows (DDA built-in)
-        "engine": "gpu",        # gpu (libplacebo) | cpu (zscale)
-        "curve": "bt.2390",     # bt.2390 | hable | mobius | reinhard | spline | st2094-40 | clip
         "auto_white": True,     # use Windows' SDR content brightness as reference white
         "white_nits": 203,      # manual reference white when auto_white is off
-        "peak_detect": True,    # dynamic per-scene brightness
+        "peak_nits": 0,         # brightest HDR highlight to roll off to (0 = what the display reports)
         "brightness": 0.0,      # -0.3..0.3
         "contrast": 1.0,        # 0.5..1.5
         "saturation": 1.0,      # 0.5..1.5
         "gamma": 1.0,           # 0.6..1.6
-        "contrast_recovery": 0.3,
     },
     "audio": {
         "system_enabled": True,
@@ -160,6 +157,7 @@ DEFAULTS: dict = {
         "overlay": True,             # "Clip saved" pop-up over the game
         "overlay_pos": "top-right",  # top-right | top-left | bottom-right | bottom-left
         "hover_preview": True,       # hover a card to scrub through the video
+        "tray_promoted": False,      # tray icon moved out of the ^ overflow once (Windows 11 hides new ones)
     },
     "controller": {                  # Xbox / XInput controller shortcuts (button names joined with +)
         "enabled": True,
