@@ -438,14 +438,19 @@ def preview_tonemap_command(hdr_cfg: dict, display_hdr, raw: Path, size: tuple[i
 # ----------------------------------------------------------------------------- clip / export
 
 def concat_command(list_file: Path, out: Path, audio_titles: list[str] | None = None,
-                   hdr10: bool = False) -> list[str]:
-    args = [ffmpeg_path(), "-hide_banner", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                   hdr10: bool = False, faststart: bool = True) -> list[str]:
+    """Stream-copy buffer segments into one MP4. `out` may have a temporary extension (always muxed as MP4).
+    faststart moves the index to the front (nicer for sharing) but re-writes the whole file - off for sessions."""
+    args = [ffmpeg_path(), "-hide_banner", "-v", "error", "-y", "-fflags", "+discardcorrupt",
+            "-f", "concat", "-safe", "0", "-i", str(list_file),
             "-map", "0", "-c", "copy", "-bsf:a", "aac_adtstoasc", "-avoid_negative_ts", "make_zero"]
     for i, t in enumerate(audio_titles or []):
         args += [f"-metadata:s:a:{i}", f"title={t}", f"-metadata:s:a:{i}", f"handler_name={t}"]
     if hdr10:
         args += hdrmod.HDR10_ENCODER_FLAGS
-    return args + ["-movflags", "+faststart", str(out)]
+    if faststart:
+        args += ["-movflags", "+faststart"]
+    return args + ["-f", "mp4", str(out)]
 
 
 def thumbnail_command(src: str, out_jpg: Path, at: float = 1.0) -> list[str]:

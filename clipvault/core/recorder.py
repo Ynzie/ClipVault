@@ -6,6 +6,8 @@ rolling buffer:
 
   * Clip (F8):          concat the segments covering [now - N s, now] -> mp4 (stream copy, instant)
   * Long recording:     pin segments from start..stop, concat on stop
+                        (a session.json marker on disk means a crash/reboot can't lose it: whatever
+                        wasn't saved is rebuilt from the leftover segments the next time ClipVault starts)
   * Bookmarks:          timestamps attached to the active long recording
   * Screenshot:         separate one-shot ddagrab grab (HDR-fixed too)
 
@@ -16,7 +18,10 @@ a point in the buffer even across ffmpeg restarts.
 from __future__ import annotations
 
 import csv
+import json
+import os
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -24,6 +29,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import logging
 
@@ -33,6 +39,10 @@ from .audio import AudioEngine, PipeFeeder
 
 
 log = logging.getLogger("clipvault.recorder")
+
+EXPORT_STALL_S = 300      # an export whose output hasn't grown for this long is stuck (no limit on total time)
+CAPTURE_STALL_S = 45      # ffmpeg alive but nothing written for this long -> restart capture
+CAPTURE_STALL_SILENT_S = 180  # same, when there's no audio track (a still screen writes nothing at all)
 
 
 class Events:
@@ -76,6 +86,29 @@ class Run:
     csv_rows: int = 0
     started: float = 0.0
     log: deque = field(default_factory=lambda: deque(maxlen=200))
+    listed: set = field(default_factory=set)       # segment files ffmpeg has finished (from segments.csv)
+    grow_key: tuple = ()                           # (newest file, size) at the last progress check
+    grow_at: float = 0.0
+    grow_check: float = 0.0
+
+
+def _sig(run: "Run") -> str:
+    return json.dumps(getattr(run.plan, "signature", None), default=list)
+
+
+def _probe_duration(path: Path) -> float:
+    try:
+        r = ff.run([ff.ffprobe_path(), "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                    str(path)], timeout=30)
+        return max(0.0, float(r.stdout.strip().split(",")[0]))
+    except Exception:
+        return 0.0
+
+
+def _write_json(path: Path, data: dict):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, default=list), "utf-8")
+    os.replace(tmp, path)
 
 
 @dataclass
@@ -109,9 +142,15 @@ class Recorder:
         self._jobs_lock = threading.Lock()
         self._launching = False
         self._reserved: set[str] = set()
+        # before the watcher starts pruning: turn anything a crash left behind into salvage folders
+        try:
+            self._salvage_after_crash()
+        except Exception:
+            log.exception("crash recovery scan failed")
+        self._cleanup_stale_buffers()
         self._watch = threading.Thread(target=self._watch_loop, daemon=True)
         self._watch.start()
-        self._cleanup_stale_buffers()
+        self._job(self._startup_chores)
 
     # ------------------------------------------------------------------ paths
     @property
@@ -235,6 +274,11 @@ class Recorder:
         plan = ff.build_record_command(self.cfg, self.monitor, audio_inputs, run_dir, t0, self.display_hdr,
                                        force_cpu_path=self._force_cpu_path)
         run.plan = plan
+        try:  # what crash recovery needs to rebuild this run's timeline later
+            _write_json(run_dir / "run.json", {"t0": t0, "signature": plan.signature, "audio_titles": plan.audio_titles,
+                                               "hdr_mode": plan.hdr_mode})
+        except OSError:
+            pass
         try:
             import subprocess
             run.proc = ff.popen(plan.args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -281,11 +325,15 @@ class Recorder:
                     run.proc.wait(timeout=4)
                 except Exception:
                     run.proc.kill()
+                    try:
+                        run.proc.wait(timeout=4)
+                    except Exception:
+                        pass
         finally:
             for f in run.feeders:
                 f.stop()
             self.audio.release()
-            self._ingest_csv(run)
+            self._adopt_tail(run)
 
     # ------------------------------------------------------------------ watcher
     def _watch_loop(self):
@@ -302,7 +350,34 @@ class Recorder:
                 self._ingest_csv(run)
                 if run.proc and run.proc.poll() is not None:
                     self._on_crash(run)
+                else:
+                    self._check_stall(run)
             self._prune()
+
+    def _check_stall(self, run: Run):
+        """ffmpeg can hang instead of exiting (e.g. the GPU driver reset when a game crashed). If nothing
+        has been written for a while, kill it - the watcher then restarts capture like after any crash."""
+        now = time.time()
+        if now - run.grow_check < 5:
+            return
+        run.grow_check = now
+        try:
+            newest = max(run.dir.glob("seg_*.ts"), default=None)
+            key = (newest.name, newest.stat().st_size) if newest else ()
+        except OSError:
+            return
+        if key != run.grow_key or not run.grow_at:
+            run.grow_key, run.grow_at = key, now
+            return
+        # audio keeps the current segment growing even on a still screen; without audio allow much longer
+        limit = CAPTURE_STALL_S if run.feeders else CAPTURE_STALL_SILENT_S
+        if now - run.grow_at > limit and now - run.started > 30:
+            log.warning("capture stalled (nothing written for %.0fs) - restarting ffmpeg", now - run.grow_at)
+            run.grow_at = now
+            try:
+                run.proc.kill()
+            except Exception:
+                pass
 
     def _ingest_csv(self, run: Run):
         f = run.dir / "segments.csv"
@@ -319,8 +394,39 @@ class Recorder:
                 seg = Segment(run.dir / row[0], float(row[1]), float(row[2]), run)
             except ValueError:
                 continue
+            if row[0] in run.listed:
+                continue
+            run.listed.add(row[0])
             self.segments.append(seg)
         run.csv_rows = len(rows)
+
+    @staticmethod
+    def _tail_segments(run: Run, listed_end: float | None) -> list[Segment]:
+        """Segment files ffmpeg never finished (it crashed or was killed mid-segment). A cut-off .ts still
+        plays up to the cut, so keep them instead of losing the last seconds before a crash."""
+        out = []
+        last = listed_end
+        for f in sorted(run.dir.glob("seg_*.ts")):
+            if f.name in run.listed:
+                continue
+            try:
+                if f.stat().st_size < 4096:
+                    continue
+            except OSError:
+                continue
+            dur = _probe_duration(f)
+            if dur <= 0.05:
+                continue
+            start = last if last is not None else 0.0
+            out.append(Segment(f, start, start + dur, run))
+            run.listed.add(f.name)
+            last = start + dur
+        return out
+
+    def _adopt_tail(self, run: Run):
+        self._ingest_csv(run)
+        ends = [s.end for s in self.segments if s.run is run]
+        self.segments.extend(self._tail_segments(run, max(ends) if ends else None))
 
     def _on_crash(self, run: Run):
         tail = "\n".join(list(run.log)[-12:])
@@ -329,6 +435,10 @@ class Recorder:
         for f in run.feeders:
             f.stop()
         self.audio.release()
+        try:
+            self._adopt_tail(run)
+        except Exception:
+            log.exception("couldn't rescue the last segment")
         self.last_error = tail or f"ffmpeg exited with code {run.proc.returncode}"
         log.error("ffmpeg exited (code %s after %.1fs). Command: %s\n%s", run.proc.returncode, lived,
                   " ".join(run.plan.args) if run.plan else "?", tail)
@@ -380,8 +490,8 @@ class Recorder:
         return max(0.0, self.segments[-1].abs_end - self.segments[0].abs_start)
 
     # ------------------------------------------------------------------ export from buffer
-    def _export_range(self, a: float, b: float, out: Path, timeout: float = 30.0) -> bool:
-        """Concat buffered segments covering absolute times [a, b] into `out`."""
+    def _collect(self, a: float, b: float, timeout: float = 30.0) -> list[Segment]:
+        """Buffered segments covering absolute times [a, b] (waits for the one that's still being written)."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self._lock:
@@ -392,19 +502,53 @@ class Recorder:
                 break
             time.sleep(0.25)
         with self._lock:
-            segs = [s for s in self.segments if s.abs_end > a and s.abs_start < b]
+            return [s for s in self.segments if s.abs_end > a and s.abs_start < b]
+
+    def _export_range(self, a: float, b: float, out: Path, timeout: float = 30.0,
+                      long: bool = False) -> tuple[list[Path], list[Segment]]:
+        """Concat the buffer for [a, b] -> (files written, segments that couldn't be written).
+
+        Clips keep only the newest stretch if settings changed mid-buffer; a long recording keeps every
+        stretch, each as its own "(part N)" file, so a capture restart never throws the start away."""
+        try:
+            return self._export_segments(self._collect(a, b, timeout), a, b, out, long)
+        finally:
+            with self._jobs_lock:
+                self._reserved.discard(str(out))
+
+    @staticmethod
+    def _groups(segs: list[Segment]) -> list[list[Segment]]:
+        """Split into stretches that can be stream-copied together (same encoder/size/HDR mode/tracks)."""
+        groups: list[list[Segment]] = []
+        for sg in segs:
+            if groups and _sig(groups[-1][-1].run) == _sig(sg.run):
+                groups[-1].append(sg)
+            else:
+                groups.append([sg])
+        return groups
+
+    def _export_segments(self, segs: list[Segment], a: float, b: float, out: Path,
+                         long: bool) -> tuple[list[Path], list[Segment]]:
+        """-> (files written, segments of any stretch that couldn't be written)"""
         if not segs:
-            return False
-        # settings changed mid-buffer (new encoder/resolution/HDR mode) -> those files can't be
-        # stream-copied together; keep the newest compatible stretch
-        sig = getattr(segs[-1].run.plan, "signature", None)
-        tail = []
-        for sg in reversed(segs):
-            if getattr(sg.run.plan, "signature", None) != sig:
-                break
-            tail.append(sg)
-        segs = list(reversed(tail))
-        lst = out.with_suffix(".concat.txt")
+            self.last_error = "nothing in the buffer for that time"
+            return [], []
+        groups = self._groups(segs)
+        if not long:
+            groups = groups[-1:]
+        outs = [out] if len(groups) == 1 else [out.with_name(f"{out.stem} (part {i}){out.suffix}")
+                                                for i in range(1, len(groups) + 1)]
+        written, failed = [], []
+        for g, o in zip(groups, outs):
+            if self._concat(g, a, b, o, long):
+                written.append(o)
+            else:
+                failed += g
+        return written, failed
+
+    def _concat(self, segs: list[Segment], a: float, b: float, out: Path, long: bool) -> bool:
+        lst = out.with_name(out.name + ".concat.txt")
+        part = out.with_name(out.name + ".part")   # never a half-written .mp4 lying around
         lines = []
         for i, s in enumerate(segs):
             safe_path = s.path.as_posix().replace("'", "'\\''")
@@ -413,29 +557,217 @@ class Recorder:
                 lines.append(f"inpoint {a - s.run.t0:.3f}")
             if i == len(segs) - 1 and b < s.abs_end:
                 lines.append(f"outpoint {b - s.run.t0:.3f}")
-        lst.write_text("\n".join(lines) + "\n", "utf-8")
         plan = segs[-1].run.plan
-        r = ff.run(ff.concat_command(lst, out, plan.audio_titles if plan else None,
-                                     hdr10=bool(plan and plan.hdr_mode == "hdr10")), timeout=3600)
-        lst.unlink(missing_ok=True)
-        with self._jobs_lock:
-            self._reserved.discard(str(out))
-        if r.returncode != 0 or not out.exists():
-            self.last_error = r.stderr[-800:]
-            log.error("export failed: %s", self.last_error)
-            return False
-        return True
+        try:
+            lst.write_text("\n".join(lines) + "\n", "utf-8")
+            args = ff.concat_command(lst, part, plan.audio_titles if plan else None,
+                                     hdr10=bool(plan and plan.hdr_mode == "hdr10"),
+                                     faststart=not long)  # faststart re-writes the whole file: skip it for big sessions
+            ok, err = self._run_watched(args, part)
+            if ok and part.exists() and part.stat().st_size > 0:
+                os.replace(part, out)
+                return True
+            self.last_error = err or "export failed"
+            log.error("export failed (%s): %s", out.name, self.last_error[-800:])
+        except Exception as e:
+            self.last_error = str(e)
+            log.exception("export failed (%s)", out.name)
+        finally:
+            lst.unlink(missing_ok=True)
+            part.unlink(missing_ok=True)
+        return False
 
-    def _name(self, kind: str, game: str | None, ext: str) -> Path:
-        stamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    @staticmethod
+    def _run_watched(args: list[str], growing: Path) -> tuple[bool, str]:
+        """Run an export with no overall time limit (a 2-hour session can take a long while on a hard
+        drive) - only give up if the output file stops growing."""
+        proc = ff.popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        text=True, errors="replace")
+        err: deque = deque(maxlen=60)
+        reader = threading.Thread(target=lambda: [err.append(l.rstrip()) for l in proc.stderr], daemon=True)
+        reader.start()
+        size, moved = -1, time.time()
+        while proc.poll() is None:
+            time.sleep(1.0)
+            try:
+                cur = growing.stat().st_size
+            except OSError:
+                cur = -1
+            if cur != size:
+                size, moved = cur, time.time()
+            elif time.time() - moved > EXPORT_STALL_S:
+                proc.kill()
+                proc.wait()
+                reader.join(2)
+                return False, f"export stopped making progress for {EXPORT_STALL_S // 60} minutes"
+        reader.join(5)
+        return proc.returncode == 0, "\n".join(err)
+
+    def _name(self, kind: str, game: str | None, ext: str, when: float | None = None, note: str = "") -> Path:
+        stamp = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H-%M-%S") if when else datetime.now().strftime("%Y-%m-%d %H-%M-%S")
         safe = "".join(c for c in (game or "Desktop") if c not in '<>:"/\\|?*').strip() or "Desktop"
         folder = self.library.folder(kind, game)
         with self._jobs_lock:
-            out, n = folder / f"{safe} {stamp}{ext}", 2
+            out, n = folder / f"{safe} {stamp}{note}{ext}", 2
             while out.exists() or str(out) in self._reserved:
-                out, n = folder / f"{safe} {stamp} ({n}){ext}", n + 1
+                out, n = folder / f"{safe} {stamp}{note} ({n}){ext}", n + 1
             self._reserved.add(str(out))
         return out
+
+    # ------------------------------------------------------------------ crash-proof long recordings
+    def _marker(self, long: LongRecording) -> Path:
+        return self.buffer_root / f"session_{long.id}.json"
+
+    def _save_marker(self, long: LongRecording, end: float | None = None):
+        try:
+            _write_json(self._marker(long), {"id": long.id, "start": long.start, "game": long.game, "end": end,
+                                             "bookmarks": long.bookmarks})
+        except OSError:
+            log.exception("couldn't write session marker")
+
+    def _salvage(self, info: dict, segs: list[Segment]) -> Path | None:
+        """Move a long recording's segments out of the rolling buffer into their own folder, so they
+        survive pruning/restarts until they're saved. Returns the folder."""
+        if not segs:
+            return None
+        d = self.buffer_root / f"salvage_{info['id']}"
+        d.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for s in segs:
+            name = f"{s.run.dir.name}_{s.path.name}"
+            try:
+                if s.path.parent != d:
+                    os.replace(s.path, d / name)
+            except OSError:
+                try:
+                    shutil.copy2(s.path, d / name)
+                except OSError:
+                    continue
+            plan = s.run.plan
+            rows.append({"file": name, "start": s.start, "end": s.end, "t0": s.run.t0,
+                         "signature": getattr(plan, "signature", None),
+                         "audio_titles": getattr(plan, "audio_titles", []), "hdr_mode": getattr(plan, "hdr_mode", "sdr")})
+        _write_json(d / "salvage.json", {"session": info, "segments": rows, "attempts": 0})
+        with self._lock:
+            moved = {id(s) for s in segs}
+            self.segments = [s for s in self.segments if id(s) not in moved]
+        return d
+
+    def _salvage_after_crash(self):
+        """Startup: a session.json marker still on disk means ClipVault (or the PC) went down before that long
+        recording was saved. Rebuild it from the leftover buffer before the buffer is cleared."""
+        markers = sorted(self.buffer_root.glob("session_*.json"))
+        if not markers:
+            return
+        runs: list[tuple[Run, list[Segment]]] = []
+        for d in sorted(self.buffer_root.glob("run_*")):
+            try:
+                info = json.loads((d / "run.json").read_text("utf-8"))
+            except (OSError, ValueError):
+                continue  # from an older version: no timing info, can't place it
+            run = Run(dir=d, t0=float(info["t0"]),
+                      plan=SimpleNamespace(signature=info.get("signature"), audio_titles=info.get("audio_titles") or [],
+                                           hdr_mode=info.get("hdr_mode") or "sdr"))
+            segs = []
+            f = d / "segments.csv"
+            if f.exists():
+                for row in csv.reader(f.read_text("utf-8", errors="replace").splitlines()):
+                    if len(row) >= 3 and (d / row[0]).exists():
+                        try:
+                            segs.append(Segment(d / row[0], float(row[1]), float(row[2]), run))
+                            run.listed.add(row[0])
+                        except ValueError:
+                            pass
+            segs += self._tail_segments(run, max((s.end for s in segs), default=None))
+            runs.append((run, segs))
+        for m in markers:
+            try:
+                info = json.loads(m.read_text("utf-8"))
+            except (OSError, ValueError):
+                m.unlink(missing_ok=True)
+                continue
+            start = float(info.get("start") or 0)
+            end = float(info.get("end") or 0) or float("inf")
+            mine = [s for _, segs in runs for s in segs if s.abs_end > start and s.abs_start < end]
+            if mine:
+                info["end"] = min(end, max(s.abs_end for s in mine))
+                info["recovered"] = True
+                self._salvage(info, mine)
+                log.info("recovering long recording %s (%s) from the buffer", info.get("id"), info.get("game"))
+            m.unlink(missing_ok=True)
+
+    def _startup_chores(self):
+        # an export that was cut off (app closed/crashed mid-save) leaves these behind; nothing is exporting yet
+        root = self.cfg.storage
+        for sub in ("Sessions", "Clips"):
+            base = root / sub
+            if not base.exists():
+                continue
+            for pat in ("*.mp4.part", "*.mp4.concat.txt", "*.concat.txt"):
+                for f in base.rglob(pat):
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+        if any(self.buffer_root.glob("salvage_*/salvage.json")):
+            self._finish_salvage()
+
+    def _finish_salvage(self):
+        """Save every salvaged long recording (from a crash, or an export that failed earlier)."""
+        for f in sorted(self.buffer_root.glob("salvage_*/salvage.json")):
+            d = f.parent
+            try:
+                data = json.loads(f.read_text("utf-8"))
+            except (OSError, ValueError):
+                continue
+            info = data.get("session") or {}
+            segs = []
+            for r in data.get("segments", []):
+                p = d / r["file"]
+                if not p.exists():
+                    continue
+                run = Run(dir=d, t0=float(r["t0"]),
+                          plan=SimpleNamespace(signature=r.get("signature"), audio_titles=r.get("audio_titles") or [],
+                                               hdr_mode=r.get("hdr_mode") or "sdr"))
+                segs.append(Segment(p, float(r["start"]), float(r["end"]), run))
+            # one Run object per original run so the stretches group correctly
+            by_t0: dict[float, Run] = {}
+            for sg in segs:
+                sg.run = by_t0.setdefault(sg.run.t0, sg.run)
+            segs.sort(key=lambda sg: sg.abs_start)
+            game = info.get("game") or "Desktop"
+            start = float(info.get("start") or (segs[0].abs_start if segs else time.time()))
+            end = float(info.get("end") or (segs[-1].abs_end if segs else start))
+            if not segs:
+                shutil.rmtree(d, ignore_errors=True)
+                continue
+            out = self._name("session", game, ".mp4", when=start, note=" (recovered)" if info.get("recovered") else "")
+            try:
+                written, failed = self._export_segments(segs, start, end, out, long=True)
+            finally:
+                with self._jobs_lock:
+                    self._reserved.discard(str(out))
+            for o in written:
+                self.library.add(o, "session", game, bookmarks=info.get("bookmarks") or [],
+                                 session_id=info.get("id"), created=start,
+                                 ended_by="recovered" if info.get("recovered") else (info.get("ended_by") or ""),
+                                 hdr=segs[-1].run.plan.hdr_mode)
+            if written and not failed:
+                shutil.rmtree(d, ignore_errors=True)
+                self.events.emit("toast", ("Long recording recovered" if info.get("recovered") else "Long recording saved",
+                                           f"{game} · {_fmt(end - start)}"))
+                log.info("salvaged long recording saved: %s", ", ".join(o.name for o in written))
+            else:
+                if written:  # keep only what still needs saving
+                    keep = {sg.path.name for sg in failed}
+                    data["segments"] = [r for r in data.get("segments", []) if r["file"] in keep]
+                    for r in list(d.glob("*.ts")):
+                        if r.name not in keep:
+                            r.unlink(missing_ok=True)
+                data["attempts"] = int(data.get("attempts", 0)) + 1
+                _write_json(f, data)
+                self.events.emit("error", f"Couldn't save the {game} long recording yet — ClipVault kept the pieces "
+                                          f"in {d.name} and will try again next start.")
 
     def _overlay(self, kind: str, title: str, sub: str = ""):
         """In-game pop-up (shown by the UI on the monitor being recorded)."""
@@ -465,8 +797,10 @@ class Recorder:
 
         def work():
             out = self._name("clip", game, ".mp4")
-            ok = self._export_range(at - seconds, at, out)
-            self.pins.pop(pin, None)
+            try:
+                ok = bool(self._export_range(at - seconds, at, out)[0])
+            finally:
+                self.pins.pop(pin, None)
             if ok:
                 meta = {"hdr": self.run.plan.hdr_mode if self.run and self.run.plan else None}
                 lg = long_at_press
@@ -505,6 +839,7 @@ class Recorder:
             self.start()
         self.long = LongRecording(id=uuid.uuid4().hex[:10], start=time.time(), game=self.game or "Desktop")
         self.pins[f"long_{self.long.id}"] = self.long.start
+        self._save_marker(self.long)
         self.alerts.play("start")
         self._overlay("start", "Long recording started", self.long.game)
         self.events.emit("long_recording", True)
@@ -523,22 +858,45 @@ class Recorder:
         self.events.emit("long_recording", False)
         self.events.emit("toast", ("Finishing long recording…", f"{_fmt(end - long.start)} · {long.game}"))
 
+        self._save_marker(long, end)
+
         def work():
-            out = self._name("session", long.game, ".mp4")
-            ok = self._export_range(long.start, end, out, timeout=30)
+            out = self._name("session", long.game, ".mp4", when=long.start)
+            written, failed = [], []
+            try:
+                written, failed = self._export_range(long.start, end, out, timeout=30, long=True)
+            except Exception as e:
+                log.exception("long recording export crashed")
+                self.last_error = str(e)
+                with self._lock:
+                    failed = [s for s in self.segments if s.abs_end > long.start and s.abs_start < end]
+            hdr_mode = self.run.plan.hdr_mode if self.run and self.run.plan else None
+            for i, o in enumerate(written):
+                item = self.library.add(o, "session", long.game, bookmarks=long.bookmarks if i == 0 else [],
+                                        session_id=long.id, created=long.start, ended_by=reason, hdr=hdr_mode)
+                if i == 0:
+                    for cid in long.clip_ids:
+                        self.library.update(cid, session_id=long.id)
+                    item["duration"] = end - long.start
+                    self.events.emit("session_saved", item)
+                    self.events.emit("toast", ("Long recording saved", o.name))
+            if not written and not failed:
+                self.events.emit("error", "Couldn't finish the long recording — nothing was captured for it. "
+                                          + (self.last_error or "")[-160:])
+            if failed:
+                # don't lose it: park the pieces outside the rolling buffer; saved on the next start
+                try:
+                    self._salvage({"id": long.id, "start": long.start, "game": long.game, "end": end,
+                                   "bookmarks": long.bookmarks, "ended_by": reason}, failed)
+                except Exception:
+                    log.exception("couldn't park the long recording's segments")
+                why = (self.last_error or "").strip().splitlines()
+                self.events.emit("error", "Couldn't finish the long recording — ClipVault kept it and will save it "
+                                          "the next time it starts." + (f" ({why[-1][:160]})" if why else ""))
+            self._marker(long).unlink(missing_ok=True)
             self.pins.pop(f"long_{long.id}", None)
-            if ok:
-                item = self.library.add(out, "session", long.game, bookmarks=long.bookmarks,
-                                        session_id=long.id, created=long.start, ended_by=reason,
-                                        hdr=self.run.plan.hdr_mode if self.run and self.run.plan else None)
-                for cid in long.clip_ids:
-                    self.library.update(cid, session_id=long.id)
-                item["duration"] = end - long.start
-                self.events.emit("session_saved", item)
-                self.events.emit("toast", ("Long recording saved", out.name))
+            if written:
                 self.library.enforce_limit()
-            else:
-                self.events.emit("error", "Couldn't finish the long recording — " + self.last_error[-200:])
         self._job(work)
 
     def bookmark(self, label: str = ""):
@@ -549,6 +907,7 @@ class Recorder:
             return
         t = time.time() - self.long.start
         self.long.bookmarks.append({"t": t, "label": label or f"Bookmark {len(self.long.bookmarks) + 1}"})
+        self._save_marker(self.long)
         self.alerts.play("bookmark")
         self._overlay("bookmark", "Bookmarked", _fmt(t))
         self.events.emit("bookmark", t)
