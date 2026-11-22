@@ -157,6 +157,7 @@ DEFAULTS: dict = {
         "overlay": True,             # "Clip saved" pop-up over the game
         "overlay_pos": "top-right",  # top-right | top-left | bottom-right | bottom-left
         "hover_preview": True,       # hover a card to scrub through the video
+        "auto_update_check": True,   # look for a newer version on GitHub when ClipVault starts
         "tray_promoted": False,      # tray icon moved out of the ^ overflow once (Windows 11 hides new ones)
     },
     "controller": {                  # Xbox / XInput controller shortcuts (button names joined with +)

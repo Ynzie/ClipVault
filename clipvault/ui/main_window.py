@@ -94,6 +94,7 @@ class MainWindow(QMainWindow):
         self.tray = QSystemTrayIcon(app_icon(W.P), self)
         self._build_tray()
         self.tray.show()
+        QTimer.singleShot(8000, self._check_updates)
         if not ctl.cfg.get("app.tray_promoted", False):
             QTimer.singleShot(3000, self._promote_tray)
         ctl.bridge.event.connect(self._on_event)
@@ -588,6 +589,26 @@ class MainWindow(QMainWindow):
         self._overlay.show_msg(msg.get("kind", "clip"), msg.get("title", ""), msg.get("sub", ""), msg.get("screen"),
                                cfg.get("app.overlay_pos", "top-right"))
 
+    def restart_for_update(self):
+        self._relaunch = True
+        self.quit()
+
+    def _check_updates(self):
+        from ..core import updater
+        if not updater.can_update() or not self.ctl.cfg.get("app.auto_update_check", True):
+            return
+        import threading
+
+        def work():
+            try:
+                info = updater.check()
+            except Exception:
+                return  # offline: try again next start
+            if info["available"] and not info["failed_before"]:
+                W.ui_call(lambda: (self.settings.show_update(info),
+                                   self.toast("Update available", f"ClipVault {info['version']} — Settings → Advanced")))
+        threading.Thread(target=work, daemon=True, name="UpdateCheck").start()
+
     def quit(self):
         """Hide right away, finish saving any session/clip in the background, then exit."""
         if self._quitting:
@@ -607,6 +628,12 @@ class MainWindow(QMainWindow):
         def poll():
             if done.is_set():
                 self.tray.hide()
+                if getattr(self, "_relaunch", False):
+                    import subprocess
+                    import os
+                    # (PYINSTALLER_RESET_ENVIRONMENT: start as a fresh copy of the app, not as a child of this one)
+                    subprocess.Popen([sys.executable, "--after-update"], close_fds=True,
+                                     env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1"))
                 QApplication.instance().quit()
             else:
                 QTimer.singleShot(200, poll)

@@ -1488,7 +1488,8 @@ class SettingsView(QWidget):
 
     # ================================================================== Advanced
     def _advanced(self):
-        page, v = page_scaffold("Advanced", "Diagnostics and fine tuning.", "settings")
+        page, v = page_scaffold("Advanced", "Updates, diagnostics and fine tuning.", "settings")
+        v.addWidget(self._updates_card())
         c = Card("Capture internals")
         c.add_row("Segment length", "Buffer chunk size. Smaller = clips start closer to the moment; 2 s is a good balance.",
                   combo([(1, "1 s"), (2, "2 s"), (4, "4 s")], self.cfg.get("recording.segment_seconds"),
@@ -1520,6 +1521,106 @@ class SettingsView(QWidget):
         c.lay.addLayout(row)
         v.addWidget(c)
         return page
+
+    # ------------------------------------------------------------------ updates
+    def _updates_card(self):
+        from ..core import updater
+        cur = updater.current()
+        c = Card("Updates", "ClipVault updates itself from GitHub — no rebuild needed.")
+        self._upd_info = None
+        self.upd_status = QLabel(f"You're on version {cur['version']}" + (f" ({cur['sha'][:7]})" if cur["sha"] else "") + ".")
+        self.upd_status.setWordWrap(True)
+        c.add(self.upd_status)
+        row = QHBoxLayout()
+        self.upd_check = QPushButton("Check for updates")
+        self.upd_check.clicked.connect(self._update_check)
+        self.upd_apply = QPushButton("Update and restart")
+        self.upd_apply.setObjectName("primary")
+        self.upd_apply.clicked.connect(self._update_apply)
+        self.upd_apply.hide()
+        page = QPushButton("Open GitHub page")
+        page.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(updater.PAGE)))
+        row.addWidget(self.upd_check)
+        row.addWidget(self.upd_apply)
+        row.addWidget(page)
+        row.addStretch(1)
+        c.lay.addSpacing(8)
+        c.lay.addLayout(row)
+        t = Toggle(self.cfg.get("app.auto_update_check", True))
+        t.toggled.connect(lambda x: self.cfg.set("app.auto_update_check", x))
+        c.add_row("Check when ClipVault starts", "Tells you when there's a new version. Nothing is installed until you click update.", t)
+        if not updater.can_update():
+            self.upd_check.setEnabled(False)
+            self.upd_status.setText(self.upd_status.text() + " Updates work in the built app (ClipVault.exe); "
+                                    "this copy is running from source.")
+        return c
+
+    def show_update(self, info: dict):
+        """Fill in the card from a finished check (also called by the startup check)."""
+        from ..core import updater
+        self._upd_info = None
+        self.upd_apply.hide()
+        if not info["available"]:
+            self.upd_status.setText(f"You're up to date (version {updater.current()['version']}).")
+            return
+        what = f"<b>Version {info['version']} is available</b> ({info['date']}): {info['message']}"
+        if info["needs_rebuild"]:
+            what += "<br>This one needs a new build: get the latest code from GitHub and run build.bat."
+        else:
+            if info["failed_before"]:
+                what += "<br>⚠ This update didn't start properly last time, so ClipVault went back to the previous version."
+            self._upd_info = info
+            self.upd_apply.show()
+        self.upd_status.setText(what)
+
+    def _update_check(self):
+        from ..core import updater
+        self.upd_check.setEnabled(False)
+        self.upd_status.setText("Checking GitHub…")
+
+        def work():
+            try:
+                info, err = updater.check(), ""
+            except Exception as e:
+                info, err = None, str(e)
+
+            def done():
+                self.upd_check.setEnabled(True)
+                if info is None:
+                    self.upd_status.setText(f"Couldn't reach GitHub ({err[:120]}).")
+                else:
+                    self.show_update(info)
+            W.ui_call(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_apply(self):
+        from ..core import updater
+        info = self._upd_info
+        if not info:
+            return
+        if self.ctl.recorder.long:
+            self.upd_status.setText("A long recording is running — stop it first, then update.")
+            return
+        self.upd_apply.setEnabled(False)
+        self.upd_check.setEnabled(False)
+
+        def work():
+            try:
+                updater.apply(info, progress=lambda s: W.ui_call(lambda: self.upd_status.setText(s)))
+                err = ""
+            except Exception as e:
+                err = str(e) or type(e).__name__
+
+            def done():
+                self.upd_apply.setEnabled(True)
+                self.upd_check.setEnabled(True)
+                if err:
+                    self.upd_status.setText(f"Update failed — nothing was changed. ({err[:160]})")
+                else:
+                    self.upd_status.setText("Installed. Restarting…")
+                    self.window().restart_for_update()
+            W.ui_call(done)
+        threading.Thread(target=work, daemon=True).start()
 
     def _refresh_diag(self):
         enc = ", ".join(sorted(e for e in ff.available_encoders() if any(x in e for x in ("amf", "nvenc", "qsv", "264", "265", "av1"))))
