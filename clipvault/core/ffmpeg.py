@@ -269,9 +269,24 @@ class RecordPlan:
         self.hdr_mode, self.zero_copy, self.description = hdr_mode, zero_copy, description
 
 
+@lru_cache(maxsize=1)
+def session_movflags() -> str:
+    """How a long recording is written straight to its final MP4: in small crash-safe chunks while
+    recording. With hybrid_fragmented (FFmpeg 7.1+) the file becomes a normal MP4 the moment it's closed."""
+    try:
+        out = run([ffmpeg_path(), "-hide_banner", "-h", "muxer=mp4"], timeout=15).stdout
+    except Exception:
+        out = ""
+    return ("+hybrid_fragmented" if "hybrid_fragmented" in out else "") + "+frag_keyframe+empty_moov+default_base_moof"
+
+
 def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path, t0: float,
-                         display_hdr: hdrmod.DisplayHDR | None, force_cpu_path: bool = False) -> RecordPlan:
-    """audio_inputs: [{'pipe': path, 'rate': 48000, 'kind': 'system'|'mic'}]"""
+                         display_hdr: hdrmod.DisplayHDR | None, force_cpu_path: bool = False,
+                         session_out: Path | None = None) -> RecordPlan:
+    """audio_inputs: [{'pipe': path, 'rate': 48000, 'kind': 'system'|'mic'}]
+
+    session_out: record a long recording directly into this MP4 (one write, nothing to join afterwards)
+    instead of the rolling buffer of 2-second pieces."""
     q = cfg.get("quality")
     h = cfg.get("hdr")
     rec = cfg.get("recording")
@@ -365,14 +380,17 @@ def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path
         args += ["-c:a", "aac", "-b:a", f"{int(a.get('bitrate_k', 192))}k", "-ar", "48000"]
         for i, t in enumerate(titles):
             args += [f"-metadata:s:a:{i}", f"title={t}"]
+    if session_out is not None:
+        args += ["-max_muxing_queue_size", "4096", "-movflags", session_movflags(), "-f", "mp4", str(session_out)]
     seg = int(rec.get("segment_seconds", 2))
     # muxdelay/preload 0: the MPEG-TS muxer otherwise shifts every timestamp by 1.4 s, so the pieces' times
     # wouldn't match the segment list (clips ended ~1.4 s before you pressed the key)
-    args += ["-max_muxing_queue_size", "4096", "-muxdelay", "0", "-muxpreload", "0",
-             "-f", "segment", "-segment_time", str(seg),
-             "-segment_format", "mpegts", "-reset_timestamps", "0",
-             "-segment_list", str(run_dir / "segments.csv"), "-segment_list_type", "csv",
-             str(run_dir / "seg_%06d.ts")]
+    if session_out is None:
+        args += ["-max_muxing_queue_size", "4096", "-muxdelay", "0", "-muxpreload", "0",
+                 "-f", "segment", "-segment_time", str(seg),
+                 "-segment_format", "mpegts", "-reset_timestamps", "0",
+                 "-segment_list", str(run_dir / "segments.csv"), "-segment_list_type", "csv",
+                 str(run_dir / "seg_%06d.ts")]
 
     desc = f"{VENDOR_LABEL.get(vendor, vendor)} · {enc} · {'zero-copy' if zero_copy else 'filtered'}"
     if hdr_mode == "tonemap":

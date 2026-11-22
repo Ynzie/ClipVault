@@ -89,16 +89,17 @@ class Controller(QObject):
         if game:
             self.game_run = {"game": game, "start": time.time(), "items": [], "session": None, "pending": 0}
             if mode in ("auto", "always"):
-                self.recorder.start()
                 if rec.get("full_session") and not self.recorder.long:
-                    self.recorder.start_long_recording()
+                    self.recorder.start_long_recording()  # (starts capture itself, straight into the session file)
+                else:
+                    self.recorder.start()
         else:
             run, self.game_run = self.game_run, None
             if run is not None:
                 run["ended"] = time.time()
                 self._closing_run = run
             if self.recorder.long and rec.get("full_session"):
-                self.recorder.stop_long_recording("game_closed")
+                self.recorder.stop_long_recording("game_closed", resume=mode != "auto")
             if mode == "auto" and not self.recorder.long:
                 self.recorder.stop("game_closed")
             if run is not None:
