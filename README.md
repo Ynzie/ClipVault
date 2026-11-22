@@ -43,3 +43,11 @@ A local-only, ad-free game recorder (Medal replacement). Everything stays on you
 * Replay buffer: `Videos\ClipVault\.buffer\` (cleaned automatically)
 
 Settings → Advanced → Diagnostics shows the exact FFmpeg command and log if capture misbehaves.
+
+## Updates
+
+The built app updates itself from this repo: **Settings → Advanced → Updates → Check for updates**, then
+**Update and restart**. It downloads the app code at the newest commit into `%APPDATA%\ClipVault\update`
+and runs that instead of the code baked into the exe, so no rebuild is needed. If an update fails to
+start, ClipVault goes back to the built-in version by itself. A change that needs new bundled files
+(a new Python package, a newer FFmpeg) still needs `build.bat`; the app tells you when that's the case.

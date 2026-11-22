@@ -1532,6 +1532,7 @@ class SettingsView(QWidget):
         self.upd_status.setWordWrap(True)
         c.add(self.upd_status)
         row = QHBoxLayout()
+        row.setSpacing(8)
         self.upd_check = QPushButton("Check for updates")
         self.upd_check.clicked.connect(self._update_check)
         self.upd_apply = QPushButton("Update and restart")

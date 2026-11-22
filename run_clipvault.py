@@ -28,7 +28,7 @@ def _discard(root, why):
                 json.dump({"sha": sha}, f)
     except (OSError, ValueError):
         pass
-    for name in ("clipvault", "installed.json", "starting"):
+    for name in ("clipvault", "installed.json", "starting") + (("baseline.json",) if why == "older" else ()):
         p = os.path.join(root, name)
         try:
             shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
