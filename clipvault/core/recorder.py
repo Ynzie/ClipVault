@@ -118,6 +118,161 @@ class LongRecording:
     game: str
     bookmarks: list = field(default_factory=list)
     clip_ids: list = field(default_factory=list)
+    writer: object = None
+
+
+class SessionWriter:
+    """Builds a long recording's MP4 *while* it records: each finished 2-second piece is streamed into a
+    stream-copy remux (MPEG-TS pieces join byte-for-byte). Stopping then takes seconds instead of re-copying
+    a whole multi-GB session after the game closes.
+
+    Only covers a single capture run. If capture restarts mid-session (crash, new settings) it steps
+    aside and the session is joined the old way at the end, which handles mixed runs."""
+
+    def __init__(self, rec: "Recorder", long: LongRecording, out: Path):
+        self.rec, self.long, self.out = rec, long, out
+        self.part = out.with_name(f"{out.stem}.live{out.suffix}.part")
+        self.proc = None
+        self.run = None
+        self.first = None              # first piece written (the file starts there)
+        self.fed: set[str] = set()
+        self.broken = ""
+        self.stop_at: float | None = None
+        self.deadline = 0.0
+        self.err: deque = deque(maxlen=40)
+        self.done = threading.Event()
+        threading.Thread(target=self._loop, daemon=True, name="SessionWriter").start()
+
+    def _open(self, run: "Run"):
+        plan = run.plan
+        args = [ff.ffmpeg_path(), "-hide_banner", "-v", "error", "-y", "-fflags", "+discardcorrupt",
+                "-f", "mpegts", "-i", "pipe:0", "-map", "0", "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                "-avoid_negative_ts", "make_zero"]
+        for i, t in enumerate(getattr(plan, "audio_titles", []) or []):
+            args += [f"-metadata:s:a:{i}", f"title={t}", f"-metadata:s:a:{i}", f"handler_name={t}"]
+        if getattr(plan, "hdr_mode", "") == "hdr10":
+            args += hdrmod.HDR10_ENCODER_FLAGS
+        args += ["-f", "mp4", str(self.part)]
+        self.proc = ff.popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        threading.Thread(target=self._read_err, daemon=True).start()
+        self.run = run
+
+    def _read_err(self):
+        try:
+            for line in self.proc.stderr:
+                self.err.append(line.decode("utf-8", "replace").rstrip())
+        except Exception:
+            pass
+
+    def _give_up(self, why: str):
+        if not self.broken:
+            self.broken = why
+            log.warning("live session writer stepped aside: %s", why)
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+                self.proc.wait(5)
+            except Exception:
+                pass
+        self.part.unlink(missing_ok=True)
+
+    def _feed(self, seg: "Segment") -> bool:
+        try:
+            with open(seg.path, "rb") as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    self.proc.stdin.write(chunk)
+            self.proc.stdin.flush()
+        except OSError as e:
+            self._give_up(f"couldn't write {seg.path.name}: {e} {' | '.join(list(self.err)[-3:])}")
+            return False
+        self.fed.add(str(seg.path))
+        if self.first is None:
+            self.first = seg
+        return True
+
+    def _loop(self):
+        try:
+            while not self.broken:
+                with self.rec._lock:
+                    todo = [sg for sg in self.rec.segments
+                            if sg.abs_end > self.long.start and str(sg.path) not in self.fed
+                            and (self.stop_at is None or sg.abs_start < self.stop_at)]
+                for sg in todo:
+                    if self.run is None:
+                        self._open(sg.run)
+                    elif sg.run is not self.run:
+                        self._give_up("capture restarted during the session")
+                        break
+                    if not self._feed(sg):
+                        break
+                if self.broken:
+                    break
+                if self.proc and self.proc.poll() is not None:
+                    self._give_up("remux stopped: " + " | ".join(list(self.err)[-3:]))
+                    break
+                if self.stop_at is not None:
+                    with self.rec._lock:
+                        covered = any(sg.abs_end >= self.stop_at and str(sg.path) in self.fed for sg in self.rec.segments)
+                        capturing = self.rec.run is not None
+                    if covered or not capturing or time.time() > self.deadline:
+                        self._close()
+                        break
+                time.sleep(0.5 if self.stop_at is not None else 1.0)
+        except Exception as e:
+            log.exception("live session writer failed")
+            self._give_up(str(e))
+        finally:
+            self.done.set()
+
+    def _close(self):
+        if not self.proc:
+            self._give_up("nothing was recorded")
+            return
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        size, moved = -1, time.time()
+        while self.proc.poll() is None:
+            time.sleep(0.5)
+            try:
+                cur = self.part.stat().st_size
+            except OSError:
+                cur = -1
+            if cur != size:
+                size, moved = cur, time.time()
+            elif time.time() - moved > EXPORT_STALL_S:
+                self._give_up("remux stopped making progress")
+                return
+        if self.proc.returncode != 0 or not self.part.exists() or self.part.stat().st_size == 0:
+            self._give_up("remux failed: " + " | ".join(list(self.err)[-3:]))
+
+    def finish(self, end: float) -> tuple[Path | None, float]:
+        """Stop at `end` (waits up to 30 s for the last piece). -> (finished file or None, seconds of
+        pre-roll before the session start that the file begins with)."""
+        self.deadline = time.time() + 30
+        self.stop_at = end
+        self.done.wait()
+        if self.broken or not self.part.exists():
+            self.part.unlink(missing_ok=True)
+            return None, 0.0
+        os.replace(self.part, self.out)
+        lead = 0.0
+        if self.first is not None:
+            try:  # the file starts at the first piece's first packet
+                r = ff.run([ff.ffprobe_path(), "-v", "error", "-show_entries", "format=start_time", "-of", "csv=p=0",
+                            str(self.first.path)], timeout=20)
+                lead = self.long.start - (self.first.run.t0 + float(r.stdout.strip().split(",")[0]))
+            except Exception:
+                lead = self.long.start - self.first.abs_start
+        return self.out, max(0.0, lead)
+
+    def abandon(self):
+        self._give_up("abandoned")
+        self.stop_at = 0.0
 
 
 class Recorder:
@@ -840,6 +995,11 @@ class Recorder:
         self.long = LongRecording(id=uuid.uuid4().hex[:10], start=time.time(), game=self.game or "Desktop")
         self.pins[f"long_{self.long.id}"] = self.long.start
         self._save_marker(self.long)
+        try:
+            out = self._name("session", self.long.game, ".mp4", when=self.long.start)
+            self.long.writer = SessionWriter(self, self.long, out)
+        except Exception:
+            log.exception("couldn't start the live session writer")
         self.alerts.play("start")
         self._overlay("start", "Long recording started", self.long.game)
         self.events.emit("long_recording", True)
@@ -861,10 +1021,25 @@ class Recorder:
         self._save_marker(long, end)
 
         def work():
-            out = self._name("session", long.game, ".mp4", when=long.start)
             written, failed = [], []
+            bookmarks = list(long.bookmarks)
+            w = long.writer
+            if w is not None:
+                try:
+                    done, lead = w.finish(end)
+                except Exception:
+                    log.exception("live session writer finish failed")
+                    done, lead = None, 0.0
+                with self._jobs_lock:
+                    self._reserved.discard(str(w.out))
+                if done:
+                    written = [done]
+                    # the file starts with up to one piece (≤2 s) before you started: keep bookmarks on their moment
+                    bookmarks = [dict(b, t=b["t"] + lead) for b in bookmarks]
+            out = w.out if w is not None else self._name("session", long.game, ".mp4", when=long.start)
             try:
-                written, failed = self._export_range(long.start, end, out, timeout=30, long=True)
+                if not written:  # no live file (capture restarted mid-session, or it failed): join the pieces now
+                    written, failed = self._export_range(long.start, end, out, timeout=30, long=True)
             except Exception as e:
                 log.exception("long recording export crashed")
                 self.last_error = str(e)
@@ -872,7 +1047,7 @@ class Recorder:
                     failed = [s for s in self.segments if s.abs_end > long.start and s.abs_start < end]
             hdr_mode = self.run.plan.hdr_mode if self.run and self.run.plan else None
             for i, o in enumerate(written):
-                item = self.library.add(o, "session", long.game, bookmarks=long.bookmarks if i == 0 else [],
+                item = self.library.add(o, "session", long.game, bookmarks=bookmarks if i == 0 else [],
                                         session_id=long.id, created=long.start, ended_by=reason, hdr=hdr_mode)
                 if i == 0:
                     for cid in long.clip_ids:

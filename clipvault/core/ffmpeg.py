@@ -366,7 +366,10 @@ def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path
         for i, t in enumerate(titles):
             args += [f"-metadata:s:a:{i}", f"title={t}"]
     seg = int(rec.get("segment_seconds", 2))
-    args += ["-max_muxing_queue_size", "4096", "-f", "segment", "-segment_time", str(seg),
+    # muxdelay/preload 0: the MPEG-TS muxer otherwise shifts every timestamp by 1.4 s, so the pieces' times
+    # wouldn't match the segment list (clips ended ~1.4 s before you pressed the key)
+    args += ["-max_muxing_queue_size", "4096", "-muxdelay", "0", "-muxpreload", "0",
+             "-f", "segment", "-segment_time", str(seg),
              "-segment_format", "mpegts", "-reset_timestamps", "0",
              "-segment_list", str(run_dir / "segments.csv"), "-segment_list_type", "csv",
              str(run_dir / "seg_%06d.ts")]
