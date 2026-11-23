@@ -523,7 +523,7 @@ class AudioEngine:
         self.gate_settings = GateSettings()
         self.reload_gate()
         cfg.on_change(self._on_cfg)
-        self._defaults = default_endpoint_ids()
+        self._defaults = None  # (read on the watcher thread: it sets up COM for itself, not for the UI thread)
         threading.Thread(target=self._watch_defaults, daemon=True, name="AudioDeviceWatch").start()
 
     # -- follow Windows' default devices (a VR headset or USB headset taking over mid-game)

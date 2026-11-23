@@ -442,6 +442,9 @@ class SettingsView(QWidget):
             lw.setStyleSheet(f"QListWidget {{ background: {P['panel2']}; border: 1px solid {P['border']}; border-radius: 8px; }}")
             for exe in self.cfg.get(f"recording.{key}"):
                 lw.addItem(exe)
+            if key == "ignored":  # Java apps are remembered by name (they all share javaw.exe with Minecraft)
+                for name in self.cfg.get("recording.ignored_java", []) or []:
+                    lw.addItem(f"{name} (Java app)")
             col.addWidget(lw)
             btns = QHBoxLayout()
             add = QPushButton("Add…")
@@ -468,8 +471,13 @@ class SettingsView(QWidget):
 
             def do_rem(_=False, key=key, lw=lw):
                 for it in lw.selectedItems():
-                    lst = [x for x in self.cfg.get(f"recording.{key}") if x != it.text()]
-                    self.cfg.set(f"recording.{key}", lst)
+                    if key == "ignored" and it.text().endswith(" (Java app)"):
+                        name = it.text()[:-len(" (Java app)")]
+                        self.cfg.set("recording.ignored_java",
+                                     [x for x in self.cfg.get("recording.ignored_java", []) or [] if x != name])
+                    else:
+                        lst = [x for x in self.cfg.get(f"recording.{key}") if x != it.text()]
+                        self.cfg.set(f"recording.{key}", lst)
                     lw.takeItem(lw.row(it))
             add.clicked.connect(do_add)
             rem.clicked.connect(do_rem)

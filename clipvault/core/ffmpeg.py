@@ -282,7 +282,7 @@ def session_movflags() -> str:
 
 def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path, t0: float,
                          display_hdr: hdrmod.DisplayHDR | None, force_cpu_path: bool = False,
-                         session_out: Path | None = None) -> RecordPlan:
+                         session_out: Path | None = None, session_plain: bool = False) -> RecordPlan:
     """audio_inputs: [{'pipe': path, 'rate': 48000, 'kind': 'system'|'mic'}]
 
     session_out: record a long recording directly into this MP4 (one write, nothing to join afterwards)
@@ -381,7 +381,10 @@ def build_record_command(cfg, mon: dict, audio_inputs: list[dict], run_dir: Path
         for i, t in enumerate(titles):
             args += [f"-metadata:s:a:{i}", f"title={t}"]
     if session_out is not None:
-        args += ["-max_muxing_queue_size", "4096", "-movflags", session_movflags(), "-f", "mp4", str(session_out)]
+        flags = session_movflags()
+        if session_plain:  # fallback if this FFmpeg/encoder can't do the hybrid kind (tidied into a normal MP4 afterwards)
+            flags = flags.replace("+hybrid_fragmented", "")
+        args += ["-max_muxing_queue_size", "4096", "-movflags", flags, "-f", "mp4", str(session_out)]
     seg = int(rec.get("segment_seconds", 2))
     # muxdelay/preload 0: the MPEG-TS muxer otherwise shifts every timestamp by 1.4 s, so the pieces' times
     # wouldn't match the segment list (clips ended ~1.4 s before you pressed the key)

@@ -93,6 +93,7 @@ class Run:
     grow_check: float = 0.0
     ended: float = 0.0
     clean: bool = False                            # ffmpeg closed its output properly
+    tidy: bool = False                             # written as a plain fragmented MP4: remux when done
     # long-recording runs (one growing MP4 instead of pieces):
     session_part: Path | None = None               # the file while it's being written
     session_file: Path | None = None               # where it ended up
@@ -236,6 +237,7 @@ class Recorder:
         self._launching = False
         self._reserved: set[str] = set()
         self.sessions: list[Run] = []      # finished long-recording files still inside the clip window
+        self._session_level = 0            # 0: hybrid MP4, 1: plain fragmented MP4 (if 0 won't start), 2: gave up
         # now, before anything records: what did a crash leave behind? (finished in the background)
         try:
             leftovers = self._find_leftovers()
@@ -309,6 +311,7 @@ class Recorder:
                 self._kill_run()
                 self._force_cpu_path = False
                 self._fail_count = 0
+                self._session_level = 0
                 self._launch()
         threading.Thread(target=go, daemon=True, name="RecorderRestart").start()
 
@@ -372,8 +375,10 @@ class Recorder:
             audio_inputs.append({"pipe": feeder.path, "rate": src.rate, "kind": kind})
 
         plan = ff.build_record_command(self.cfg, self.monitor, audio_inputs, run_dir, t0, self.display_hdr,
-                                       force_cpu_path=self._force_cpu_path, session_out=run.session_part)
+                                       force_cpu_path=self._force_cpu_path, session_out=run.session_part,
+                                       session_plain=self._session_level >= 1)
         run.plan = plan
+        run.tidy = run.session_part is not None and (self._session_level >= 1 or "hybrid" not in ff.session_movflags())
         try:
             run.proc = ff.popen(plan.args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.PIPE, text=True, errors="replace")
@@ -435,11 +440,13 @@ class Recorder:
     def _end_run(self, run: Run):
         run.ended = time.time()
         run.clean = bool(run.proc) and run.proc.returncode == 0
+        if run.session_part is not None and (run.tidy or not run.clean):
+            self._scan_session(run)  # (the file's layout is unchanged: pick up the last chunks)
         if run.session_part is None:
             self._adopt_tail(run)
             return
         run.session_file = run.session_part  # (not indexed any further: closing rewrites the file's layout)
-        if run.clean and run.frags:
+        if run.clean and not run.tidy and run.frags:
             self.sessions.append(run)
 
     # ------------------------------------------------------------------ watcher
@@ -597,6 +604,23 @@ class Recorder:
         self.events.emit("log", tail)
         if not self._want_running:
             return
+        if run.session_part is not None and lived < 20 and not run.frags and self.long is not None \
+                and not (lived < 6 and run.plan and run.plan.zero_copy and not self._force_cpu_path):
+            # writing the long recording straight to its file doesn't work here: try the simpler format,
+            # and if that fails too, keep the clip buffer working instead of failing over and over
+            self._session_level += 1
+            log.warning("long-recording capture failed to start (level %d)", self._session_level)
+            if self._session_level >= 2:
+                long, self.long = self.long, None
+                self._marker(long).unlink(missing_ok=True)
+                for r in long.parts:
+                    if r.session_part:
+                        r.session_part.unlink(missing_ok=True)
+                with self._jobs_lock:
+                    self._reserved.discard(str(long.out))
+                self.events.emit("long_recording", False)
+                self.events.emit("error", "The long recording couldn't start on this PC (see Settings → Advanced → "
+                                          "Diagnostics). Clips still work.")
         if lived < 6 and run.plan and run.plan.zero_copy and not self._force_cpu_path:
             self._force_cpu_path = True  # zero-copy path not supported by this driver/build -> filtered path
             self.events.emit("status", "GPU zero-copy not supported here — switching to compatible capture path")
@@ -609,7 +633,14 @@ class Recorder:
             self._want_running = False
             return
         time.sleep(min(5, 0.5 * self._fail_count + 0.5))
-        self._launch()
+        try:
+            self._launch()
+        except Exception as e:
+            log.exception("relaunch failed")
+            self.last_error = str(e)
+            self.state = "error"
+            self.events.emit("state", self.state)
+            self.events.emit("error", f"Couldn't restart recording: {e}")
 
     def _prune(self):
         keep_s = max(int(self.cfg.get("recording.buffer_seconds", 300)), int(self.cfg.get("recording.clip_seconds", 60)),
@@ -954,6 +985,9 @@ class Recorder:
         self.pins[pin] = at - seconds
         game = self.game or (self.long.game if self.long else None)
         long_at_press = self.long
+        if long_at_press:  # mark the moment in the long recording now (it may be saved before the clip is)
+            long_at_press.bookmarks.append({"t": at - long_at_press.start, "label": "Clip", "clip": True})
+            self._save_marker(long_at_press)
         self.alerts.play("clip")
         self.events.emit("toast", ("Saving clip…", f"Last {seconds}s"))
         self._overlay("clip", "Clip saved", (f"Last {seconds} s" if seconds < 120 else f"Last {seconds // 60} min")
@@ -970,7 +1004,6 @@ class Recorder:
                 lg = long_at_press
                 if lg:
                     meta["session_id"] = lg.id
-                    lg.bookmarks.append({"t": at - lg.start, "label": "Clip", "clip": True})
                 item = self.library.add(out, "clip", game, **meta)
                 if lg:
                     lg.clip_ids.append(item["id"])
@@ -1046,7 +1079,7 @@ class Recorder:
         def work():
             info = {"id": long.id, "start": long.start, "game": long.game, "bookmarks": long.bookmarks,
                     "ended_by": reason, "hdr": hdr_mode}
-            parts = [{"part": r.session_part, "clean": r.clean, "abs0": r.abs0, "run": r} for r in long.parts]
+            parts = [{"part": r.session_part, "clean": r.clean and not r.tidy, "abs0": r.abs0, "run": r} for r in long.parts]
             try:
                 items = self._finish_session(info, parts, long.out)
             finally:
