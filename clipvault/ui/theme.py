@@ -72,7 +72,7 @@ def stylesheet(p: dict) -> str:
 * {{ font-family: "Segoe UI Variable Text", "Segoe UI", "Inter", sans-serif; font-size: 10pt; color: {p['text']}; }}
 QMainWindow, QWidget#root, QDialog, QMessageBox, QInputDialog, QFileDialog {{ background: {p['bg']}; }}
 QWidget#sidebar {{ background: {p['panel']}; border-right: 1px solid {p['border']}; }}
-QWidget#topbar {{ background: {p['bg']}; border-bottom: 1px solid {p['border']}; }}
+QWidget#topbar {{ background: {p['panel']}; border-bottom: 1px solid {p['border']}; }}
 QLabel#h1 {{ font-size: 18pt; font-weight: 700; }}
 QLabel#h2 {{ font-size: 13pt; font-weight: 650; }}
 QLabel#h3 {{ font-size: 10.5pt; font-weight: 650; }}
@@ -134,11 +134,12 @@ QSlider::handle:horizontal {{ background: {knob}; border: 1px solid rgba(0,0,0,0
 QSlider::handle:horizontal:hover {{ background: {p['accent2']}; }}
 
 QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}
-QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-QScrollBar::handle:vertical {{ background: {p['panel3']}; border-radius: 4px; min-height: 30px; }}
-QScrollBar::handle:vertical:hover {{ background: {_mix(p['panel3'], '#ffffff', .1)}; }}
-QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
-QScrollBar::handle:horizontal {{ background: {p['panel3']}; border-radius: 4px; min-width: 30px; }}
+QScrollBar:vertical {{ background: transparent; width: 8px; margin: 3px 2px; }}
+QScrollBar::handle:vertical {{ background: {_mix(p['panel3'], p['accent'], .22)}; border-radius: 3px; min-height: 30px; }}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:vertical:pressed {{ background: {_mix(p['panel3'], p['accent'], .7)}; }}
+QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 2px 3px; }}
+QScrollBar::handle:horizontal {{ background: {_mix(p['panel3'], p['accent'], .22)}; border-radius: 3px; min-width: 30px; }}
+QScrollBar::handle:horizontal:hover, QScrollBar::handle:horizontal:pressed {{ background: {_mix(p['panel3'], p['accent'], .7)}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 

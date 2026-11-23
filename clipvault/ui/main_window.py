@@ -90,7 +90,7 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._tray_hint_shown = False
         self._build()
-        W.style_title_bar(self)
+        W.style_title_bar(self, W.P["panel"])  # same color as the sidebar and top bar
         self.tray = QSystemTrayIcon(app_icon(W.P), self)
         self._build_tray()
         self.tray.show()
@@ -163,7 +163,7 @@ class MainWindow(QMainWindow):
         self.editor.shutdown()  # detach the video engine before its window is destroyed
         self.settings._hold_audio(False)
         self._build("settings")
-        W.style_title_bar(self)
+        W.style_title_bar(self, W.P["panel"])  # same color as the sidebar and top bar
         self.settings.show_page("look")
         self.tray.setIcon(app_icon(W.P))
 
@@ -252,9 +252,9 @@ class MainWindow(QMainWindow):
         sv = QVBoxLayout(sw)
         sv.setContentsMargins(0, 0, 0, 0)
         sv.setSpacing(2)
-        sec = QLabel("GAMES")
+        sec = QLabel("GAMES")  # outside the scroll area: never half cut off when the list is scrolled
         sec.setObjectName("section")
-        sv.addWidget(sec)
+        v.addWidget(sec)
         self.games_box = QVBoxLayout()
         self.games_box.setSpacing(2)
         sv.addLayout(self.games_box)
