@@ -86,6 +86,70 @@ def list_devices() -> dict[str, list[Device]]:
     return out
 
 
+def _reset_pa():
+    """PortAudio only lists devices (and which one is the default) when it starts. Start it over to see
+    the current ones. Every stream must be closed first."""
+    global _pa
+    with _pa_lock:
+        if _pa is not None:
+            try:
+                _pa.terminate()
+            except Exception:
+                pass
+            _pa = None
+
+
+def default_endpoint_ids() -> tuple[str, str] | None:
+    """Windows' current default (playback, recording) device ids, straight from the system - this
+    changes the moment a headset takes over (e.g. putting on a Quest). None if it can't be read."""
+    if not IS_WIN:
+        return None
+    try:
+        import ctypes
+        import uuid
+        from ctypes import POINTER, WINFUNCTYPE, byref, c_long, c_uint, c_void_p
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("a", ctypes.c_ubyte * 16)]
+
+        def guid(text):
+            return GUID.from_buffer_copy(uuid.UUID(text).bytes_le)
+
+        def method(obj, index, *argtypes):
+            vtbl = ctypes.cast(obj, POINTER(POINTER(c_void_p)))[0]
+            return WINFUNCTYPE(c_long, c_void_p, *argtypes)(vtbl[index])
+
+        ole32 = ctypes.WinDLL("ole32")
+        ole32.CoInitializeEx(None, 0)
+        ole32.CoCreateInstance.argtypes = [c_void_p, c_void_p, c_uint, c_void_p, POINTER(c_void_p)]
+        ole32.CoTaskMemFree.argtypes = [c_void_p]
+        enum = c_void_p()
+        if ole32.CoCreateInstance(byref(guid("BCDE0395-E52F-467C-8E3D-C4579291692E")), None, 23,
+                                  byref(guid("A95664D2-9614-4F35-A746-DE8DB63617E6")), byref(enum)) < 0 or not enum:
+            return None
+        ids = []
+        try:
+            for flow in (0, 1):  # eRender, eCapture (role 0 = eConsole)
+                dev = c_void_p()
+                if method(enum, 4, c_uint, c_uint, POINTER(c_void_p))(enum, flow, 0, byref(dev)) < 0 or not dev:
+                    ids.append("")   # no such device right now
+                    continue
+                try:
+                    text = c_void_p()
+                    if method(dev, 5, POINTER(c_void_p))(dev, byref(text)) >= 0 and text:
+                        ids.append(ctypes.wstring_at(text.value))
+                        ole32.CoTaskMemFree(text)
+                    else:
+                        ids.append("")
+                finally:
+                    method(dev, 2)(dev)
+        finally:
+            method(enum, 2)(enum)
+        return ids[0], ids[1]
+    except Exception:
+        return None
+
+
 def pick_device(kind: str, wanted: str) -> Device | None:
     devs = list_devices().get(kind, [])
     if wanted:
@@ -174,7 +238,8 @@ class Source:
                  gate: GateSettings | None = None, mono: bool = False):
         self.kind = kind
         self.device = device
-        self.rate = device.rate if device else 48000
+        self.rate = device.rate if device else 48000          # what subscribers get - fixed for the source's life
+        self.dev_rate = self.rate                             # what the device delivers (differs after a device switch)
         self.in_channels = device.channels if device else 2
         self.channels = 2
         self.volume = volume
@@ -207,27 +272,32 @@ class Source:
         if self._running:
             return
         self._running = True
-        _com_init()
-        pa = _get_pa()
-        if pa is not None and self.device is None:
-            self.error = "No device found"
-        if pa is not None and self.device is not None:
-            try:
-                self._stream = pa.open(format=pyaudio.paInt16, channels=self.in_channels, rate=self.rate,
-                                       frames_per_buffer=self.BLOCK, input=True,
-                                       input_device_index=self.device.index,
-                                       stream_callback=self._pa_callback)
-                self._stream.start_stream()
-                return
-            except Exception as e:  # device busy / unplugged
-                self.error = f"{self.device.name}: {e}"
-                log.warning("could not open %s source: %s", self.kind, self.error)
+        if self._open_stream():
+            return
         if os.environ.get("CLIPVAULT_FAKE_AUDIO"):
             self._fake_thread = threading.Thread(target=self._fake_loop, daemon=True)
             self._fake_thread.start()
 
-    def stop(self):
-        self._running = False
+    def _open_stream(self) -> bool:
+        _com_init()
+        pa = _get_pa()
+        self.error = ""
+        if pa is not None and self.device is None:
+            self.error = "No device found"
+        if pa is not None and self.device is not None:
+            try:
+                self._stream = pa.open(format=pyaudio.paInt16, channels=self.in_channels, rate=self.dev_rate,
+                                       frames_per_buffer=self.BLOCK, input=True,
+                                       input_device_index=self.device.index,
+                                       stream_callback=self._pa_callback)
+                self._stream.start_stream()
+                return True
+            except Exception as e:  # device busy / unplugged
+                self.error = f"{self.device.name}: {e}"
+                log.warning("could not open %s source: %s", self.kind, self.error)
+        return False
+
+    def _close_stream(self):
         if self._stream is not None:
             try:
                 self._stream.stop_stream()
@@ -235,6 +305,19 @@ class Source:
             except Exception:
                 pass
             self._stream = None
+
+    def stop(self):
+        self._running = False
+        self._close_stream()
+
+    def rebind(self, device: Device | None) -> bool:
+        """Switch to another device mid-recording. Subscribers (the recording, the virtual mic) stay
+        attached and keep getting audio at the original rate."""
+        self._close_stream()
+        self.device = device
+        if device is not None:
+            self.dev_rate, self.in_channels = device.rate, device.channels
+        return self._running and self._open_stream()
 
     def _pa_callback(self, in_data, frame_count, time_info, status):
         try:
@@ -258,6 +341,8 @@ class Source:
                 time.sleep(delay)
 
     def _ingest(self, pcm: np.ndarray):
+        if self.dev_rate != self.rate and pcm.shape[0]:
+            pcm = resample(pcm, self.dev_rate, self.rate)
         x = pcm.astype(np.float32) / 32768.0
         # channel fold to stereo
         if x.shape[1] == 1:
@@ -438,6 +523,62 @@ class AudioEngine:
         self.gate_settings = GateSettings()
         self.reload_gate()
         cfg.on_change(self._on_cfg)
+        self._defaults = default_endpoint_ids()
+        threading.Thread(target=self._watch_defaults, daemon=True, name="AudioDeviceWatch").start()
+
+    # -- follow Windows' default devices (a VR headset or USB headset taking over mid-game)
+    def _watch_defaults(self):
+        while True:
+            time.sleep(2.0)
+            try:
+                ids = default_endpoint_ids()
+                if ids is None or ids == self._defaults:
+                    continue
+                old, self._defaults = self._defaults, ids
+                if old is not None:
+                    self._follow_defaults(out_changed=ids[0] != old[0], in_changed=ids[1] != old[1])
+            except Exception:
+                log.exception("audio device watch failed")
+
+    def _follow_defaults(self, out_changed: bool = True, in_changed: bool = True):
+        a = self.cfg.get("audio")
+        with self._lock:
+            follow_sys = bool(self.system) and not a.get("system_device") and out_changed
+            follow_mic = bool(self.mic) and not a.get("mic_device") and in_changed
+            if not self._refs or not (follow_sys or follow_mic):
+                return
+            # PortAudio has to be restarted to see the new default, which needs every stream closed
+            mon = getattr(self, "_monitor", None)
+            if mon:  # (just a "listen to my mic" test)
+                self.stop_monitor()
+                mon.join(2)
+            pt, self._passthrough = self._passthrough, None
+            had_passthrough = pt is not None
+            if pt:
+                pt.stop()
+                pt.join(2)
+            if not self._refs:
+                return
+            for s in (self.system, self.mic):
+                if s:
+                    s._close_stream()
+            _reset_pa()
+            names = []
+            for s, wanted in ((self.system, a.get("system_device")), (self.mic, a.get("mic_device"))):
+                if not s:
+                    continue
+                dev = pick_device("loopback" if s.kind == "system" else "mic", wanted)
+                moved = dev is not None and (s.device is None or dev.name != s.device.name)
+                ok = s.rebind(dev if dev is not None else s.device)
+                if moved and ok:
+                    names.append(("PC audio" if s.kind == "system" else "Mic") + f" → {dev.name}")
+                elif not ok and s.error:
+                    self._notify(f"{'PC audio' if s.kind == 'system' else 'Microphone'} unavailable", s.error, True)
+            if had_passthrough:
+                self._sync_passthrough()
+        if names:
+            log.info("default audio device changed: %s", "; ".join(names))
+            self._notify("Audio device changed", " · ".join(names))
 
     def _notify(self, title, msg, error=False):
         if error:
