@@ -1557,7 +1557,8 @@ class SettingsView(QWidget):
         c.lay.addLayout(row)
         t = Toggle(self.cfg.get("app.auto_update_check", True))
         t.toggled.connect(lambda x: self.cfg.set("app.auto_update_check", x))
-        c.add_row("Check when ClipVault starts", "Tells you when there's a new version. Nothing is installed until you click update.", t)
+        c.add_row("Check when ClipVault starts", "Checks when ClipVault starts and every 3 hours while it runs, and tells you once per new "
+                  "version (after your game, never during it). Nothing is installed until you click update.", t)
         if not updater.can_update():
             self.upd_check.setEnabled(False)
             self.upd_status.setText(self.upd_status.text() + " Updates work in the built app (ClipVault.exe); "

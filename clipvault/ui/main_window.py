@@ -95,6 +95,12 @@ class MainWindow(QMainWindow):
         self._build_tray()
         self.tray.show()
         QTimer.singleShot(8000, self._check_updates)
+        # ClipVault usually runs for days in the tray: keep looking, not just at startup
+        self._update_pending = None
+        self._upd_timer = QTimer(self, interval=3 * 3600 * 1000, timeout=self._check_updates)
+        self._upd_timer.start()
+        self._upd_nag = QTimer(self, interval=5 * 60 * 1000, timeout=self._announce_update)  # waits out a game
+        self.tray.messageClicked.connect(self._tray_message_clicked)
         if not ctl.cfg.get("app.tray_promoted", False):
             QTimer.singleShot(3000, self._promote_tray)
         ctl.bridge.event.connect(self._on_event)
@@ -603,11 +609,42 @@ class MainWindow(QMainWindow):
             try:
                 info = updater.check()
             except Exception:
-                return  # offline: try again next start
+                return  # offline: the next check (in a few hours) tries again
             if info["available"] and not info["failed_before"]:
-                W.ui_call(lambda: (self.settings.show_update(info),
-                                   self.toast("Update available", f"ClipVault {info['version']} — Settings → Advanced")))
+                W.ui_call(lambda: self._have_update(info))
         threading.Thread(target=work, daemon=True, name="UpdateCheck").start()
+
+    def _have_update(self, info: dict):
+        self.settings.show_update(info)
+        if self.ctl.cfg.get("app.update_notified") == info["sha"]:
+            return  # already told you about this one
+        self._update_pending = info
+        self._announce_update()
+
+    def _announce_update(self):
+        info = self._update_pending
+        if info is None:
+            self._upd_nag.stop()
+            return
+        if self.ctl.games.current or self.ctl.recorder.long:
+            self._upd_nag.start()  # don't pop up over a game: try again once it's over
+            return
+        self._upd_nag.stop()
+        self._update_pending = None
+        self.ctl.cfg.set("app.update_notified", info["sha"])
+        msg = f"ClipVault {info['version']} is ready — {info['message']}"[:200]
+        if self.isVisible() and not self.isMinimized():
+            self.toast("Update available", f"ClipVault {info['version']} — Settings → Advanced")
+        else:  # in the tray: a Windows notification, click it to open the Updates card
+            self._tray_opens_updates = True
+            self.tray.showMessage("Update available", msg + "\nClick to update.", QSystemTrayIcon.Information, 15000)
+
+    def _tray_message_clicked(self):
+        if getattr(self, "_tray_opens_updates", False):
+            self._tray_opens_updates = False
+            self.bring_up()
+            self.show_page("settings")
+            self.settings.show_page("advanced")
 
     def quit(self):
         """Hide right away, finish saving any session/clip in the background, then exit."""
