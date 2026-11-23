@@ -19,6 +19,10 @@ if not errorlevel 1 (
     goto :waitquit
 )
 
+REM a recorder process left behind by a ClipVault that crashed or was force-closed keeps ffmpeg.exe
+REM locked ("Access is denied" at the end of the build). Only ones running from a built ClipVault folder.
+powershell -NoProfile -Command "Get-Process ffmpeg,ffprobe -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*\_internal\ffmpeg\*' } | Stop-Process -Force" >nul 2>nul
+
 echo [1/6] Creating virtual environment...
 if not exist .venv (
     %PY% -m venv .venv || goto :fail
