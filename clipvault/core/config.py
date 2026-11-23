@@ -65,6 +65,7 @@ DEFAULTS: dict = {
         "games": ["iw4x.exe", "iw4m.exe", "VRChat.exe", "Rocksmith2014.exe", "Lethal Company.exe",
                   "cod.exe", "cs2.exe", "VALORANT-Win64-Shipping.exe", "r5apex.exe",
                   "FortniteClient-Win64-Shipping.exe", "javaw.exe"],
+        "ignored_java": [],     # Java apps (by window name) marked "Not a game"
         "ignored": ["explorer.exe", "chrome.exe", "msedge.exe", "brave.exe", "firefox.exe", "Discord.exe",
                     "Spotify.exe", "ClipVault.exe", "Medal.exe", "steamwebhelper.exe", "AfterFX.exe",
                     "Adobe Media Encoder.exe", "Code.exe", "devenv.exe", "Unity.exe", "blender.exe"],

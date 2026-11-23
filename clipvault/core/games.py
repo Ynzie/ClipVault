@@ -39,7 +39,28 @@ NEVER_GAMES = {x.lower() for x in (
 FULLSCREEN_GRACE = 6.0
 
 
-def pretty_name(exe: str) -> str:
+# Java programs all run as javaw.exe, so the exe name says nothing: Minecraft, TuxGuitar and a
+# dozen other apps look identical. Tell them apart by the window title.
+JAVA_HOSTS = {"javaw.exe", "java.exe"}
+MINECRAFT_TITLES = ("minecraft", "lunar client", "badlion", "feather client", "labymod", "forge", "fabric",
+                    "optifine", "modrinth", "curseforge", "prism launcher", "multimc", "tlauncher")
+
+
+def java_app_name(title: str) -> str:
+    """Minecraft for anything that looks like it; otherwise the app's own name from its window title."""
+    import re
+    low = (title or "").lower()
+    if any(k in low for k in MINECRAFT_TITLES):
+        return "Minecraft"
+    name = re.split(r"\s+[-–—|:]\s+|\s+\(", (title or "").strip())[0]
+    name = re.sub(r"\s+v?\d[\d.]*\w*$", "", name).strip()          # drop a trailing version number
+    name = "".join(c for c in name if c not in '<>:"/\\|?*').strip(" .")
+    return name[:40] or "Java app"
+
+
+def pretty_name(exe: str, title: str = "") -> str:
+    if exe.lower() in JAVA_HOSTS:
+        return java_app_name(title)
     stem = Path(exe).stem
     return PRETTY.get(stem.lower(), stem.replace("_", " ").replace("-Win64-Shipping", ""))
 
@@ -191,17 +212,26 @@ class GameWatcher(threading.Thread):
         self._candidate, self._since = None, 0.0
         self._gone_since = 0.0
 
-    def classify(self, exe: str, full: bool) -> str | None:
+    def is_listed(self, exe: str, title: str = "") -> bool:
+        """On your games list. javaw.exe on the list means Minecraft, not every Java program."""
+        low = exe.lower()
+        if low not in (g.lower() for g in self.cfg.get("recording.games", [])):
+            return False
+        return low not in JAVA_HOSTS or java_app_name(title) == "Minecraft"
+
+    def classify(self, exe: str, full: bool, title: str = "") -> str | None:
         if not exe:
             return None
         rec = self.cfg.get("recording")
         low = exe.lower()
-        if low in (g.lower() for g in rec.get("games", [])):  # your own list always wins
-            return pretty_name(exe)
+        if self.is_listed(exe, title):  # your own list always wins
+            return pretty_name(exe, title)
         if low in NEVER_GAMES or low in (g.lower() for g in rec.get("ignored", [])):
             return None
+        if low in JAVA_HOSTS and java_app_name(title).lower() in (g.lower() for g in rec.get("ignored_java", [])):
+            return None  # a Java app you marked "Not a game" (by name - Minecraft shares its exe)
         if rec.get("detect_fullscreen", True) and full:
-            return pretty_name(exe)
+            return pretty_name(exe, title)
         return None
 
     def run(self):
@@ -210,10 +240,10 @@ class GameWatcher(threading.Thread):
         while not self._halt.is_set():
             now = time.time()
             try:
-                exe, full, _, pid = foreground_app()
-                game = self.classify(exe, full)
+                exe, full, title, pid = foreground_app()
+                game = self.classify(exe, full, title)
             except Exception:
-                game, pid = None, 0
+                game, pid, exe, title = None, 0, "", ""
             if self.current:
                 # anti-cheat games can refuse OpenProcess -> also trust the game's window still existing
                 if not process_alive(self.pid) and not window_alive(self.hwnd):
@@ -226,7 +256,7 @@ class GameWatcher(threading.Thread):
                         self.current, self.pid, self._candidate = None, 0, None
                         self.on_change(None)
             elif game:
-                listed = exe.lower() in (g.lower() for g in self.cfg.get("recording.games", []))
+                listed = self.is_listed(exe, title)
                 if game != self._candidate:
                     self._candidate, self._since = game, now
                 elif now - self._since >= (2.0 if listed else FULLSCREEN_GRACE):
@@ -242,6 +272,16 @@ class GameWatcher(threading.Thread):
         exe = self.current_exe
         if not exe:
             return None
+        if exe.lower() in JAVA_HOSTS and self.current != "Minecraft":
+            # ignoring javaw.exe itself would switch Minecraft off too: remember this app by name instead
+            names = list(self.cfg.get("recording.ignored_java", []) or [])
+            if self.current and self.current.lower() not in (n.lower() for n in names):
+                names.append(self.current)
+            self.cfg.set("recording.ignored_java", names)
+            name = self.current
+            self.current, self.pid, self.hwnd, self._candidate, self.current_exe = None, 0, 0, None, ""
+            self.on_change(None)
+            return name
         ign = list(self.cfg.get("recording.ignored", []))
         if exe.lower() not in (x.lower() for x in ign):
             ign.append(exe)
